@@ -1,0 +1,22 @@
+# Local MOTIS instance for SEPTA isochrone development.
+#
+# The MOTIS binary is at /motis. `motis import` writes its generated dataset
+# into a `data/` subdirectory of the current working dir; `motis server` wants
+# to be pointed at that subdirectory directly.
+#
+# One-time data build (takes ~minutes, chews RAM):
+#   docker compose run --rm -w /workspace motis /motis import
+#
+# Serve (long-running):
+#   docker compose up motis
+services:
+  motis:
+    image: ghcr.io/motis-project/motis:latest
+    working_dir: /workspace
+    # Point server at the ./data subdirectory that `motis import` creates.
+    command: ["/motis", "server", "/workspace/data"]
+    volumes:
+      - ./data:/workspace
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
