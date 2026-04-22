@@ -28,24 +28,14 @@ function metersPerDegLon(latDeg: number): number {
   return M_PER_DEG_LAT * Math.cos((latDeg * Math.PI) / 180);
 }
 
-// Cell size in meters. The polygon boundary is built from marching
-// squares over the grid, so cell size = edge resolution. Smaller =
-// smoother polygon but more MOTIS cells (quadratic in budget-reach).
-// Floor is ~60m — below that diminishing returns kick in because
-// MOTIS's street-snap tolerance and inter-block spacing dominate.
-function cellSizeM(mode: StreetMode, maxMinutes: number): number {
-  if (mode === "bike") {
-    if (maxMinutes >= 75) return 350;
-    if (maxMinutes >= 60) return 250;
-    if (maxMinutes >= 45) return 175;
-    if (maxMinutes >= 30) return 125;
-    return 90;
-  }
-  if (maxMinutes >= 75) return 200;
-  if (maxMinutes >= 60) return 150;
-  if (maxMinutes >= 45) return 100;
-  if (maxMinutes >= 30) return 80;
-  return 60;
+// Cell size in meters. Flat per-mode: the bbox is already bounded by
+// the reachable-stops envelope (see stopsEnvelope in the route handler),
+// so cell count doesn't blow up quadratically with budget like the
+// worst-case bbox would have. 60m walk / 90m bike matches MOTIS's
+// ~25m street-snap tolerance closely enough that going finer mostly
+// adds noise from cells that all snap to the same street edge.
+function cellSizeM(mode: StreetMode): number {
+  return mode === "bike" ? 90 : 60;
 }
 
 // Worst-case transit reach for bbox sizing when the caller doesn't
@@ -84,7 +74,7 @@ export async function graphIsochrone(args: {
     maxLon: origin.lon + reachM / mPerLon,
   };
 
-  const cellM = cellSizeM(mode, maxMinutes);
+  const cellM = cellSizeM(mode);
   const widthM = (bbox.maxLon - bbox.minLon) * mPerLon;
   const heightM = (bbox.maxLat - bbox.minLat) * mPerLat;
   const nx = Math.max(16, Math.round(widthM / cellM));
@@ -121,9 +111,15 @@ export async function graphIsochrone(args: {
       preTransitModes: [streetMode],
       postTransitModes: [streetMode],
       directMode: streetMode,
-      // Matching distance: let MOTIS snap cells in the middle of a block
-      // to the nearest street. Half the cell diagonal is a safe ceiling.
-      maxMatchingDistance: Math.ceil((cellM * Math.SQRT2) / 2),
+      // Matching distance: how far a target cell can be from a walkable
+      // OSM way and still get counted as reachable. MUST stay tight —
+      // beyond ~20m, MOTIS's foot profile snaps to the RiverLink ferry
+      // edge (`route=ferry; foot=yes` in OSM), which makes mid-Delaware
+      // cells "walkable" across the river in ~15 min. 18m is the floor
+      // that still lets real urban mid-block cells match (streets in
+      // Philly are spaced ~80-100m, and even the tightest probes —
+      // Univ City, Fairmount Park — snap at 18m).
+      maxMatchingDistance: 18,
       useRoutedTransfers: true,
       // Street-Dijkstra cost scales sharply with these. Bike is ~6x more
       // expensive per minute than walk (bike graph is denser and faster,
@@ -169,12 +165,10 @@ export async function graphIsochrone(args: {
     field[i] = d <= maxSec ? maxMinutes - d / 60 : -Infinity;
   }
 
-  // Morphological close (3x3 dilate then erode) to bridge near-touching
-  // islands and fill single-cell pin-prick holes left by the street-graph
-  // sampling. Operates on the continuous cost field — cells deep in the
-  // reachable interior have far-above-threshold values that dilation
-  // can't change visibly, so this only affects the boundary.
-  morphologicalCloseField(field, nx, ny);
+  // (Previously: 3x3 dilate+erode to fill single-cell pinholes. Removed —
+  // it also bridged narrow unreachable gaps, most visibly fusing Philly's
+  // walk-reach with Camden's PATCO transit-reach across the Delaware. The
+  // hole-area filter below handles the real interior-artifact case.)
 
   const gen = contours().size([nx, ny]).thresholds([0]);
   const polys = gen(Array.from(field));
@@ -214,50 +208,6 @@ export async function graphIsochrone(args: {
     properties: { minutes: maxMinutes, method: "graph" },
     geometry: { type: "MultiPolygon", coordinates: kept },
   };
-}
-
-// In-place 3x3 dilate then erode on a row-major field. Dilate picks the
-// max of each cell's 3x3 neighborhood; erode picks the min. The pair
-// fills gaps up to 1 cell wide without shifting the overall polygon
-// position (unlike a pure dilate, which would grow everything).
-function morphologicalCloseField(field: Float64Array, nx: number, ny: number): void {
-  const buf = new Float64Array(nx * ny);
-  // Dilate: buf[i] = max over 3x3 neighborhood of field.
-  for (let y = 0; y < ny; y++) {
-    for (let x = 0; x < nx; x++) {
-      let best = -Infinity;
-      const y0 = y > 0 ? y - 1 : 0;
-      const y1 = y < ny - 1 ? y + 1 : ny - 1;
-      const x0 = x > 0 ? x - 1 : 0;
-      const x1 = x < nx - 1 ? x + 1 : nx - 1;
-      for (let yy = y0; yy <= y1; yy++) {
-        const row = yy * nx;
-        for (let xx = x0; xx <= x1; xx++) {
-          const v = field[row + xx];
-          if (v > best) best = v;
-        }
-      }
-      buf[y * nx + x] = best;
-    }
-  }
-  // Erode: field[i] = min over 3x3 neighborhood of buf.
-  for (let y = 0; y < ny; y++) {
-    for (let x = 0; x < nx; x++) {
-      let best = Infinity;
-      const y0 = y > 0 ? y - 1 : 0;
-      const y1 = y < ny - 1 ? y + 1 : ny - 1;
-      const x0 = x > 0 ? x - 1 : 0;
-      const x1 = x < nx - 1 ? x + 1 : nx - 1;
-      for (let yy = y0; yy <= y1; yy++) {
-        const row = yy * nx;
-        for (let xx = x0; xx <= x1; xx++) {
-          const v = buf[row + xx];
-          if (v < best) best = v;
-        }
-      }
-      field[y * nx + x] = best;
-    }
-  }
 }
 
 // Signed shoelace area of a ring in cell-grid coordinates. Sign reflects

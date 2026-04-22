@@ -19,7 +19,11 @@ type IsochroneEnvelope = {
 const PHILLY: [number, number] = [-75.1635, 39.9526];
 const DEFAULT_MINUTES = 30;
 const MIN_MINUTES = 5;
-const MAX_MINUTES = 90;
+// Capped at 60 min so the graph-based isochrone stays sub-~7s cold at
+// ~60m/90m cells. The 75-90 min range was lovely to look at but
+// the 5-10s quadratic-in-reach latency on those queries pushed the UX
+// past "snappy" in a way that wasn't paying for itself.
+const MAX_MINUTES = 60;
 
 const MAPTILER_KEY = process.env.NEXT_PUBLIC_MAPTILER_KEY;
 const BASEMAP_STYLE = MAPTILER_KEY
@@ -512,12 +516,16 @@ export default function Map() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-run the last query when departure/bestCase/mode changes, so toggling
-  // the UI updates the visible isochrone without the user having to re-click.
+  // Re-run on param changes — debounced so slider drags don't fire a
+  // graph-isochrone compute for every intermediate value. 400ms is long
+  // enough to ride out a drag, short enough to feel responsive when the
+  // user lands on a value and stops.
   useEffect(() => {
-    if (clickRef.current) runQuery(clickRef.current.lat, clickRef.current.lng);
-    // runQuery is stable (useCallback); we intentionally drive re-runs off
-    // the input values rather than adding it to deps.
+    if (!clickRef.current) return;
+    const id = window.setTimeout(() => {
+      if (clickRef.current) runQuery(clickRef.current.lat, clickRef.current.lng);
+    }, 400);
+    return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [departure, bestCase, minutes, streetMode]);
 

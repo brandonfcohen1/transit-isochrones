@@ -112,8 +112,8 @@ export async function GET(req: Request) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return NextResponse.json({ error: "lat and lon required" }, { status: 400 });
   }
-  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 90) {
-    return NextResponse.json({ error: "minutes must be 1-90" }, { status: 400 });
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 60) {
+    return NextResponse.json({ error: "minutes must be 1-60" }, { status: 400 });
   }
 
   const times = timesCsv ? timesCsv.split(",").filter(Boolean) : [time];
