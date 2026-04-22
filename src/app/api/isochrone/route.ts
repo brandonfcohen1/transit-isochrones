@@ -105,9 +105,11 @@ export async function GET(req: Request) {
   // method=graph (default): poll MOTIS one-to-many-intermodal on a dense
   // grid so the polygon respects the transit+street graph end-to-end
   // (rivers without bridges, rail yards, etc.). method=approx falls back
-  // to the fast Euclidean-disk approximation. best-case scans always
-  // use approx, since the cost would be 18× graph queries.
-  const method = url.searchParams.get("method") === "approx" || timesCsv ? "approx" : "graph";
+  // to the fast Euclidean-disk approximation. For best-case scans, we
+  // still run graph once — at whichever sample time has the most
+  // reachable stops — rather than N graph calls (too slow) or approx
+  // (low fidelity). The stops list is still the union over all times.
+  const method = url.searchParams.get("method") === "approx" ? "approx" : "graph";
 
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return NextResponse.json({ error: "lat and lon required" }, { status: 400 });
@@ -142,13 +144,14 @@ export async function GET(req: Request) {
     ...(mode === "bike" ? { maxPreTransitTime: minutes * 60 } : {}),
   };
 
-  // Split into cached vs uncached sample times.
+  // Keep stops keyed to their sample time so we can pick the best one
+  // for the graph query below. Cache per-time as before.
+  const byTime = new Map<string, SlimStop[]>();
   const missTimes: string[] = [];
-  const hitBatches: SlimStop[][] = [];
   for (const t of times) {
     const k = cacheKey(lat, lon, minutes, t, mode, safe);
     const hit = CACHE.get(k);
-    if (hit) hitBatches.push(hit);
+    if (hit) byTime.set(t, hit);
     else missTimes.push(t);
   }
 
@@ -163,14 +166,25 @@ export async function GET(req: Request) {
       for (let i = 0; i < missTimes.length; i++) {
         const slim = projectSlim(results[i].data as Reachable);
         CACHE.set(cacheKey(lat, lon, minutes, missTimes[i], mode, safe), slim);
-        hitBatches.push(slim);
+        byTime.set(missTimes[i], slim);
       }
     }
   }
 
   if (err) return NextResponse.json({ error: err }, { status: 502 });
 
+  const hitBatches = Array.from(byTime.values());
   const stops = mergeSlim(hitBatches);
+
+  // Pick the sample time with the most reachable stops for the graph
+  // call. For single-time queries this is a no-op; for best-case scans
+  // it biases toward peak-transit departures where the polygon covers
+  // the largest area.
+  let bestTime = time;
+  let bestCount = -1;
+  for (const [t, batch] of byTime) {
+    if (batch.length > bestCount) { bestCount = batch.length; bestTime = t; }
+  }
 
   let polygon: Feature<Polygon | MultiPolygon> | null;
   if (method === "graph") {
@@ -180,7 +194,7 @@ export async function GET(req: Request) {
     // it won't miss anything — a cell not reachable via any stop also
     // isn't reachable period.
     const bbox = stopsEnvelope({ lat, lon }, stops, minutes, mode);
-    const gk = graphKey(lat, lon, minutes, time, mode);
+    const gk = graphKey(lat, lon, minutes, bestTime, mode);
     const cached = GRAPH_CACHE.get(gk);
     if (cached !== undefined) {
       polygon = cached;
@@ -189,7 +203,7 @@ export async function GET(req: Request) {
         origin: { lat, lon },
         maxMinutes: minutes,
         mode,
-        time,
+        time: bestTime,
         motisUrl: MOTIS_URL,
         bbox,
       });

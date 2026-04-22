@@ -319,6 +319,19 @@ export default function Map() {
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
 
     map.on("load", () => {
+      // Iso fill goes on first so rail route lines render ON TOP of it.
+      // Drawing routes under the 30% fill made parallel dark-blue Regional
+      // Rail lines (Paoli, Cynwyd, Norristown HSL) bleed through as a
+      // darker diagonal band in Haverford/Ardmore — looked like a second
+      // polygon but was actually rail lines showing through the fill.
+      map.addSource("iso", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+      map.addLayer({
+        id: "iso-fill",
+        type: "fill",
+        source: "iso",
+        paint: { "fill-color": "#3b82f6", "fill-opacity": 0.3 },
+      });
+
       map.addSource("septa-routes", { type: "geojson", data: "/septa-routes.geojson" });
       map.addLayer({
         id: "routes-line",
@@ -353,14 +366,6 @@ export default function Map() {
           "text-halo-color": "#ffffff",
           "text-halo-width": 1.5,
         },
-      });
-
-      map.addSource("iso", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-      map.addLayer({
-        id: "iso-fill",
-        type: "fill",
-        source: "iso",
-        paint: { "fill-color": "#3b82f6", "fill-opacity": 0.3 },
       });
       map.addLayer({
         id: "iso-outline",
