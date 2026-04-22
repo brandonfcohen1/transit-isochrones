@@ -5,6 +5,7 @@ import { oneToAll } from "@/lib/motis";
 import { buildIsochrone, type SlimStop, type StopMode, type StreetMode } from "@/lib/isochrone";
 import { streetGridStops } from "@/lib/streetGrid";
 import { graphIsochrone } from "@/lib/graphIsochrone";
+import { probeRailReach } from "@/lib/railProbe";
 import { LRU } from "@/lib/cache";
 
 const MOTIS_URL = process.env.MOTIS_URL ?? "http://localhost:8080";
@@ -39,6 +40,19 @@ function streetKey(lat: number, lon: number, minutes: number, mode: StreetMode):
 // Graph-isochrone polygon cache. Time matters (transit schedules vary by
 // hour), but within an hour-bucket the polygon is stable.
 const GRAPH_CACHE = new LRU<string, Feature<Polygon | MultiPolygon> | null>(200);
+
+// Rail-probe cache — same shape of key as the graph cache.
+// probeRailReach is the expensive path (plan() per station ≈ 40s for a
+// 14h searchWindow), so caching wins big on repeat queries in the same
+// session even if the polygon-level cache misses.
+type RailCacheEntry = Array<{ lat: number; lon: number; reachedAtMinutes: number; stopId: string; name: string }>;
+const RAIL_CACHE = new LRU<string, RailCacheEntry>(200);
+function railKey(lat: number, lon: number, minutes: number, time: string, windowSec: number): string {
+  const la = Math.round(lat * 1e4) / 1e4;
+  const lo = Math.round(lon * 1e4) / 1e4;
+  const hour = time.slice(0, 13);
+  return `${la},${lo},${minutes},${hour},${windowSec}`;
+}
 function graphKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode): string {
   const la = Math.round(lat * 1e4) / 1e4;
   const lo = Math.round(lon * 1e4) / 1e4;
@@ -89,6 +103,11 @@ function mergeSlim(batches: SlimStop[][]): SlimStop[] {
 // GET /api/isochrone?lat=..&lon=..&minutes=30&time=<iso>&mode=walk|bike&safe=true
 // For best-case: pass `timesCsv=iso1,iso2,...`. Response is a slim envelope:
 //   { polygon: Feature<MultiPolygon> | null, stops: SlimStop[], minutes, origin, mode }
+// Best-case + rail probe at 14-hour searchWindow can hit 45s cold.
+// Default route timeout trips at 30s on some Next adapters; lift it
+// explicitly so the query has room. Warm cache hits are <50ms.
+export const maxDuration = 60;
+
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const lat = Number(url.searchParams.get("lat"));
@@ -191,12 +210,6 @@ export async function GET(req: Request) {
 
   let polygon: Feature<Polygon | MultiPolygon> | null;
   if (method === "graph") {
-    // Bbox: tight envelope around reachable transit stops + a
-    // full-budget walking/biking buffer at each stop's own remainder.
-    // Far cheaper than covering the worst-case Regional-Rail reach, and
-    // it won't miss anything — a cell not reachable via any stop also
-    // isn't reachable period.
-    const bbox = stopsEnvelope({ lat, lon }, stops, minutes, mode);
     // Cache key includes all graph-sample times so best-case unions
     // and single-time queries don't collide.
     const gk = graphKey(lat, lon, minutes, graphTimes.join("|"), mode);
@@ -204,16 +217,38 @@ export async function GET(req: Request) {
     if (cached !== undefined) {
       polygon = cached;
     } else {
-      // MOTIS's experimental intermodal endpoint under-represents
-      // Regional Rail reach from coordinate origins (rail platforms are
-      // poorly connected to the walkable graph without osr_footpath,
-      // and enabling osr_footpath breaks intermodal elsewhere). Work
-      // around: `oneToAll` knows the correct arrival time at each rail
-      // stop, so we hand those to the graph as reach anchors and
-      // rasterize a walking-radius disk around each into the field.
-      const railAnchors = stops
-        .filter((s) => s.m === "rail" && s.d < minutes)
-        .map((s) => ({ lat: s.lat, lon: s.lon, reachedAtMinutes: s.d }));
+      // Rail discovery: oneToAll is a single-instant query, so it
+      // misses stops whose fastest itinerary only exists if you start
+      // 10 min later to catch the next train. plan() has timetableView
+      // and optimizes the departure moment within a search window —
+      // the Paoli-line suburbs (Ardmore, Haverford, Bryn Mawr) only
+      // show up this way. Single-time queries use a 60-min window;
+      // best-case uses a full-day window so one probe per station
+      // finds the fastest trip across the whole day.
+      const railWindowSec = timesCsv ? 14 * 3600 : 3600;
+      const rk = railKey(lat, lon, minutes, graphTimes[0], railWindowSec);
+      let railAnchors = RAIL_CACHE.get(rk);
+      if (!railAnchors) {
+        railAnchors = await probeRailReach({
+          origin: { lat, lon },
+          maxMinutes: minutes,
+          time: graphTimes[0],
+          searchWindowSec: railWindowSec,
+          motisUrl: MOTIS_URL,
+        });
+        RAIL_CACHE.set(rk, railAnchors);
+      }
+
+      // Bbox: envelope around reachable transit stops + walking buffer
+      // at each remaining budget. Critically, rail anchors found via
+      // plan() are often outside `oneToAll`'s stops list, so we add
+      // them here too — otherwise their walking disks land off-grid
+      // and never contribute to the polygon.
+      const bboxSeedStops: Array<{ lat: number; lon: number; d: number }> = [
+        ...stops,
+        ...railAnchors.map((a) => ({ lat: a.lat, lon: a.lon, d: a.reachedAtMinutes })),
+      ];
+      const bbox = stopsEnvelope({ lat, lon }, bboxSeedStops as SlimStop[], minutes, mode);
       polygon = await graphIsochrone({
         origin: { lat, lon },
         maxMinutes: minutes,

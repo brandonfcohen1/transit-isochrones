@@ -45,10 +45,13 @@ function nowLocalInputValue(): string {
 // to UTC ISO — the server is TZ-agnostic.
 const BEST_CASE_START_HOUR = 5;
 const BEST_CASE_END_HOUR = 23;
-// Sample every 20 min. Hourly missed the Paoli line's ~30-min cadence
-// so stops only reachable by specific departures (e.g. the 12:15 train
-// to Ardmore) fell outside our window and never appeared.
-const BEST_CASE_STEP_MIN = 20;
+// Sample every 5 min. oneToAll is "depart at exactly this moment" — no
+// timetableView/searchWindow — so to catch a 29-min trip to Ardmore
+// that only works boarding the :12 Paoli train (walk 7 min, 0 wait,
+// ride 22 min), we need a sample within ~3 min of the ideal departure.
+// 10-min sampling still missed Ardmore / Haverford / Bryn Mawr from
+// City Hall; 5-min should land within any train's departure window.
+const BEST_CASE_STEP_MIN = 5;
 
 function bestCaseSampleTimes(departureLocal: string): string[] {
   const datePart = departureLocal.split("T")[0];
