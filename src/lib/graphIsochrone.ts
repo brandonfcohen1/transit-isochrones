@@ -172,47 +172,79 @@ export async function graphIsochrone(args: {
     });
   }
 
-  // Rasterize walking-reach disks for any extra anchors the caller
-  // supplied (typically Regional Rail stations that intermodal couldn't
-  // route to). Each anchor knows it's reachable at `reachedAtMinutes`
-  // from `oneToAll` — the remaining walking budget fans out a disk of
-  // (maxMin - reached) minutes at walking speed. Lower cost wins per
-  // cell. Using Euclidean walk here because the alternative (per-anchor
-  // streetGridStops call) adds seconds per query and this is already
-  // about filling a known MOTIS-side gap.
+  // Street-routed reach from each reach anchor (typically Regional
+  // Rail stations that intermodal couldn't route to). For each anchor
+  // we ask MOTIS `/api/v1/one-to-many` with mode=WALK to every grid
+  // cell within the anchor's remaining walking budget — this gives
+  // real street distances, not the Euclidean circle the previous
+  // implementation drew. Adds ~1-3s cold per query (cached at the
+  // polygon level upstream, so repeat clicks are free).
   if (reachAnchors && reachAnchors.length > 0) {
-    const walkMPerMin = (5 * 1000) / 60; // 5 km/h walk
-    const detour = 1.3;
-    const mPerMin = walkMPerMin / detour;
-    for (const a of reachAnchors) {
+    const walkSpeedMPerMin = (5 * 1000) / 60; // 5 km/h ceiling
+    const fromGridLatLon = (x: number, y: number): [number, number] => [
+      bbox.minLat + ((y + 0.5) / ny) * (bbox.maxLat - bbox.minLat),
+      bbox.minLon + ((x + 0.5) / nx) * (bbox.maxLon - bbox.minLon),
+    ];
+    const fanAnchor = async (a: NonNullable<typeof reachAnchors>[number]): Promise<void> => {
       const remainingMin = maxMinutes - a.reachedAtMinutes;
-      if (remainingMin <= 0) continue;
-      // Anchor position in cell grid space.
+      if (remainingMin <= 0) return;
+      // Collect grid cells within the anchor's walking budget (at a
+      // generous speed so real routed paths, which are never faster
+      // than straight-line, have room to match).
+      const radiusCells = (remainingMin * walkSpeedMPerMin) / cellM;
+      if (radiusCells <= 0) return;
       const ax = ((a.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * nx;
       const ay = ((a.lat - bbox.minLat) / (bbox.maxLat - bbox.minLat)) * ny;
-      const radiusCells = (remainingMin * mPerMin) / cellM;
-      if (radiusCells <= 0) continue;
       const r2 = radiusCells * radiusCells;
       const ymin = Math.max(0, Math.floor(ay - radiusCells));
       const ymax = Math.min(ny - 1, Math.ceil(ay + radiusCells));
       const xmin = Math.max(0, Math.floor(ax - radiusCells));
       const xmax = Math.min(nx - 1, Math.ceil(ax + radiusCells));
+      const targets: { idx: number; coord: string }[] = [];
       for (let y = ymin; y <= ymax; y++) {
         const dy = y + 0.5 - ay;
         const dyS = dy * dy;
         if (dyS > r2) continue;
-        const rowOff = y * nx;
         for (let x = xmin; x <= xmax; x++) {
           const dx = x + 0.5 - ax;
-          const dS = dx * dx + dyS;
-          if (dS >= r2) continue;
-          const newCostSec = (a.reachedAtMinutes + (Math.sqrt(dS) * cellM) / mPerMin) * 60;
-          if (newCostSec < durationsSec[rowOff + x]) {
-            durationsSec[rowOff + x] = newCostSec;
+          if (dx * dx + dyS > r2) continue;
+          const [lat, lon] = fromGridLatLon(x, y);
+          // /api/v1/one-to-many uses semicolon-separated lat;lon.
+          targets.push({ idx: y * nx + x, coord: `${lat.toFixed(5)};${lon.toFixed(5)}` });
+        }
+      }
+      if (targets.length === 0) return;
+      const reachedSec = a.reachedAtMinutes * 60;
+      for (let start = 0; start < targets.length; start += MAX_MANY_PER_REQUEST) {
+        const slice = targets.slice(start, start + MAX_MANY_PER_REQUEST);
+        const body = {
+          one: `${a.lat};${a.lon}`,
+          many: slice.map((t) => t.coord),
+          mode: "WALK",
+          max: Math.ceil(remainingMin * 60),
+          // Cells can land mid-block; allow the same match slack that
+          // streetGridStops uses so they still snap to a nearby street.
+          maxMatchingDistance: 80,
+          arriveBy: false,
+        };
+        const res = await fetch(`${motisUrl}/api/v1/one-to-many`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) continue;
+        const arr = (await res.json()) as Array<{ duration?: number }>;
+        for (let i = 0; i < slice.length; i++) {
+          const walkSec = arr[i]?.duration;
+          if (walkSec == null) continue;
+          const totalSec = reachedSec + walkSec;
+          if (totalSec < durationsSec[slice[i].idx]) {
+            durationsSec[slice[i].idx] = totalSec;
           }
         }
       }
-    }
+    };
+    await parallelWithLimit(reachAnchors, 8, fanAnchor);
   }
 
   // Build the field. Positive = reachable with that many minutes of slack.
