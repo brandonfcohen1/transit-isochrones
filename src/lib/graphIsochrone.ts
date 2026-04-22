@@ -53,11 +53,15 @@ export async function graphIsochrone(args: {
   origin: { lat: number; lon: number };
   maxMinutes: number;
   mode: StreetMode;
-  time: string;
+  // Pass one time for a single-instant isochrone, or multiple times to
+  // get a "best-case over the day" polygon — we take the min duration
+  // per cell across all provided times before contouring.
+  times: string[];
   motisUrl: string;
   bbox?: { minLat: number; maxLat: number; minLon: number; maxLon: number };
 }): Promise<Feature<Polygon | MultiPolygon> | null> {
-  const { origin, maxMinutes, mode, time, motisUrl } = args;
+  const { origin, maxMinutes, mode, times, motisUrl } = args;
+  if (times.length === 0) return null;
   const streetMode: Mode = mode === "bike" ? "BIKE" : "WALK";
 
   const mPerLat = M_PER_DEG_LAT;
@@ -97,64 +101,70 @@ export async function graphIsochrone(args: {
   const batchCount = Math.ceil(targets.length / MAX_MANY_PER_REQUEST);
   const batchIdx = Array.from({ length: batchCount }, (_, i) => i);
 
-  await parallelWithLimit(batchIdx, CONCURRENCY, async (bi) => {
-    const start = bi * MAX_MANY_PER_REQUEST;
-    const end = Math.min(targets.length, start + MAX_MANY_PER_REQUEST);
-    const slice = targets.slice(start, end);
-    const body = {
-      one: `${origin.lat},${origin.lon}`,
-      many: slice,
-      time,
-      maxTravelTime: maxMinutes,
-      arriveBy: false,
-      transitModes: ["TRANSIT"],
-      preTransitModes: [streetMode],
-      postTransitModes: [streetMode],
-      directMode: streetMode,
-      // Matching distance: how far a target cell can be from a walkable
-      // OSM way and still get counted as reachable. MUST stay tight —
-      // beyond ~20m, MOTIS's foot profile snaps to the RiverLink ferry
-      // edge (`route=ferry; foot=yes` in OSM), which makes mid-Delaware
-      // cells "walkable" across the river in ~15 min. 18m is the floor
-      // that still lets real urban mid-block cells match (streets in
-      // Philly are spaced ~80-100m, and even the tightest probes —
-      // Univ City, Fairmount Park — snap at 18m).
-      maxMatchingDistance: 18,
-      useRoutedTransfers: true,
-      // Street-Dijkstra cost scales sharply with these. Bike is ~6x more
-      // expensive per minute than walk (bike graph is denser and faster,
-      // so the search frontier expands much wider in the same budget).
-      // Measured: walk pre=15 ≈ 1.5s/batch, bike pre=15 ≈ 8.5s/batch.
-      // Bike pre=5 drops to 1.1s/batch and still covers downtown transit
-      // density (5 min bike ≈ 1.8km — hits any nearby subway/regional).
-      maxPreTransitTime: (mode === "bike" ? 5 : 15) * 60,
-      maxPostTransitTime: (mode === "bike" ? 5 : 15) * 60,
-      // Direct (no-transit) path cap. For bike the direct leg IS the
-      // main use case (bike alone is often faster than bike+transit),
-      // so we let it ride the full budget. For walk, cap at 45 min —
-      // beyond that, transit always wins.
-      maxDirectTime: Math.min(maxMinutes, mode === "bike" ? maxMinutes : 45) * 60,
-    };
-    const res = await fetch(`${motisUrl}/api/experimental/one-to-many-intermodal`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) return;
-    const j = (await res.json()) as IntermodalResponse;
-    const street = j.street_durations ?? [];
-    const transit = j.transit_durations ?? [];
-    for (let i = 0; i < slice.length; i++) {
-      let best = Infinity;
-      const sd = street[i]?.duration;
-      if (sd != null && sd < best) best = sd;
-      const pset = transit[i] ?? [];
-      for (const p of pset) {
-        if (p.duration != null && p.duration < best) best = p.duration;
+  // For each sample time, query MOTIS and keep the min duration per cell.
+  // Times run sequentially so we don't saturate MOTIS's thread pool —
+  // each time internally fans out to CONCURRENCY parallel batches.
+  for (const time of times) {
+    await parallelWithLimit(batchIdx, CONCURRENCY, async (bi) => {
+      const start = bi * MAX_MANY_PER_REQUEST;
+      const end = Math.min(targets.length, start + MAX_MANY_PER_REQUEST);
+      const slice = targets.slice(start, end);
+      const body = {
+        one: `${origin.lat},${origin.lon}`,
+        many: slice,
+        time,
+        maxTravelTime: maxMinutes,
+        arriveBy: false,
+        transitModes: ["TRANSIT"],
+        preTransitModes: [streetMode],
+        postTransitModes: [streetMode],
+        directMode: streetMode,
+        // Matching distance: how far a target cell can be from a walkable
+        // OSM way and still get counted as reachable. MUST stay tight —
+        // beyond ~20m, MOTIS's foot profile snaps to the RiverLink ferry
+        // edge (`route=ferry; foot=yes` in OSM), which makes mid-Delaware
+        // cells "walkable" across the river in ~15 min. 18m is the floor
+        // that still lets real urban mid-block cells match (streets in
+        // Philly are spaced ~80-100m, and even the tightest probes —
+        // Univ City, Fairmount Park — snap at 18m).
+        maxMatchingDistance: 18,
+        useRoutedTransfers: true,
+        // Street-Dijkstra cost scales sharply with these. Bike is ~6x more
+        // expensive per minute than walk (bike graph is denser and faster,
+        // so the search frontier expands much wider in the same budget).
+        // Measured: walk pre=15 ≈ 1.5s/batch, bike pre=15 ≈ 8.5s/batch.
+        // Bike pre=5 drops to 1.1s/batch and still covers downtown transit
+        // density (5 min bike ≈ 1.8km — hits any nearby subway/regional).
+        maxPreTransitTime: (mode === "bike" ? 5 : 15) * 60,
+        maxPostTransitTime: (mode === "bike" ? 5 : 15) * 60,
+        // Direct (no-transit) path cap. For bike the direct leg IS the
+        // main use case (bike alone is often faster than bike+transit),
+        // so we let it ride the full budget. For walk, cap at 45 min —
+        // beyond that, transit always wins.
+        maxDirectTime: Math.min(maxMinutes, mode === "bike" ? maxMinutes : 45) * 60,
+      };
+      const res = await fetch(`${motisUrl}/api/experimental/one-to-many-intermodal`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) return;
+      const j = (await res.json()) as IntermodalResponse;
+      const street = j.street_durations ?? [];
+      const transit = j.transit_durations ?? [];
+      for (let i = 0; i < slice.length; i++) {
+        let best = Infinity;
+        const sd = street[i]?.duration;
+        if (sd != null && sd < best) best = sd;
+        const pset = transit[i] ?? [];
+        for (const p of pset) {
+          if (p.duration != null && p.duration < best) best = p.duration;
+        }
+        const idx = start + i;
+        if (best < durationsSec[idx]) durationsSec[idx] = best;
       }
-      if (best !== Infinity) durationsSec[start + i] = best;
-    }
-  });
+    });
+  }
 
   // Build the field. Positive = reachable with that many minutes of slack.
   // -Infinity = unreachable. d3-contour encloses cells ABOVE threshold 0.

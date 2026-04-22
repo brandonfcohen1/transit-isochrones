@@ -176,15 +176,18 @@ export async function GET(req: Request) {
   const hitBatches = Array.from(byTime.values());
   const stops = mergeSlim(hitBatches);
 
-  // Pick the sample time with the most reachable stops for the graph
-  // call. For single-time queries this is a no-op; for best-case scans
-  // it biases toward peak-transit departures where the polygon covers
-  // the largest area.
-  let bestTime = time;
-  let bestCount = -1;
-  for (const [t, batch] of byTime) {
-    if (batch.length > bestCount) { bestCount = batch.length; bestTime = t; }
-  }
+  // For the graph call, use the top-K sample times by reachable-stops
+  // count. Single-time queries → just that one time. Best-case scans
+  // (18 times) → 3 representative peaks so the polygon covers the
+  // day's best reach without spending 18× MOTIS-intermodal calls.
+  // (K=3 picked empirically: K=4 costs ~14s at City Hall 30min,
+  // K=3 is ~10s, K=2 loses meaningful station-reach coverage.)
+  const GRAPH_SAMPLE_K = 3;
+  const sortedTimes = Array.from(byTime.entries())
+    .sort((a, b) => b[1].length - a[1].length)
+    .slice(0, Math.min(GRAPH_SAMPLE_K, byTime.size))
+    .map(([t]) => t);
+  const graphTimes = sortedTimes.length > 0 ? sortedTimes : [time];
 
   let polygon: Feature<Polygon | MultiPolygon> | null;
   if (method === "graph") {
@@ -194,7 +197,9 @@ export async function GET(req: Request) {
     // it won't miss anything — a cell not reachable via any stop also
     // isn't reachable period.
     const bbox = stopsEnvelope({ lat, lon }, stops, minutes, mode);
-    const gk = graphKey(lat, lon, minutes, bestTime, mode);
+    // Cache key includes all graph-sample times so best-case unions
+    // and single-time queries don't collide.
+    const gk = graphKey(lat, lon, minutes, graphTimes.join("|"), mode);
     const cached = GRAPH_CACHE.get(gk);
     if (cached !== undefined) {
       polygon = cached;
@@ -203,7 +208,7 @@ export async function GET(req: Request) {
         origin: { lat, lon },
         maxMinutes: minutes,
         mode,
-        time: bestTime,
+        times: graphTimes,
         motisUrl: MOTIS_URL,
         bbox,
       });
