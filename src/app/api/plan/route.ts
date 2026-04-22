@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import type { Itinerary, Leg, Mode, PlanResponse } from "@motis-project/motis-client";
-import { plan } from "@/lib/motis";
+import { plan, reverseGeocode } from "@/lib/motis";
 import { decodePolyline } from "@/lib/polyline";
 
 // Slim leg shape — client needs geometry + enough to color/label the segment.
@@ -80,7 +80,10 @@ export async function GET(req: Request) {
   const fromPlace = `${fromLat},${fromLon}`;
   const toPlace = toStop ?? `${toLat},${toLon}`;
 
-  const { data, error } = await plan({
+  // Plan + (for free-coord destinations) reverse-geocode in parallel —
+  // MOTIS labels unknown coords as "END" in the itinerary, so we patch
+  // the client-facing name with the closest named place.
+  const planPromise = plan({
     query: {
       fromPlace,
       toPlace,
@@ -99,13 +102,23 @@ export async function GET(req: Request) {
       maxDirectTime: 60 * 60,
     },
   });
+  const reverseGeocodePromise: Promise<string | undefined> = toStop
+    ? Promise.resolve(undefined)
+    : reverseGeocode({ query: { place: `${toLat},${toLon}` } })
+        .then((r) => {
+          const hits = r.data as Array<{ name?: string }> | undefined;
+          return hits?.[0]?.name;
+        })
+        .catch(() => undefined);
 
-  if (error) return NextResponse.json({ error }, { status: 502 });
-  const body = data as PlanResponse;
+  const [planRes, destName] = await Promise.all([planPromise, reverseGeocodePromise]);
+  if (planRes.error) return NextResponse.json({ error: planRes.error }, { status: 502 });
+  const body = planRes.data as PlanResponse;
   return NextResponse.json(
     {
       itineraries: (body.itineraries ?? []).map(slimItinerary),
       direct: (body.direct ?? []).map(slimItinerary),
+      destinationName: destName,
     },
     { headers: { "Cache-Control": "public, max-age=60" } },
   );

@@ -6,9 +6,9 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import type { Feature, MultiPolygon, Polygon } from "geojson";
 import type { SlimItinerary } from "@/app/api/plan/route";
 
-type StopMode = "rail" | "subway" | "tram" | "bus" | "other";
+type StopMode = "rail" | "subway" | "trolley" | "bus" | "other";
 type StreetMode = "walk" | "bike";
-type SlimStop = { id: string; lat: number; lon: number; d: number; m: StopMode };
+type SlimStop = { id: string; lat: number; lon: number; d: number; m: StopMode; n?: string };
 type IsochroneEnvelope = {
   polygon: Feature<Polygon | MultiPolygon> | null;
   stops: SlimStop[];
@@ -61,6 +61,12 @@ type RouteInfo = {
   itinerary: SlimItinerary;
 };
 
+// SEPTA nomenclature: GTFS/MOTIS emit "TRAM" for the 10/11/13/15/34/36
+// trolley lines, but nobody in Philly calls them trams.
+function displayMode(mode: string): string {
+  return mode === "TRAM" ? "TROLLEY" : mode;
+}
+
 // Line color per leg mode. Transit modes reuse the stop palette for
 // consistency; walk/bike are neutrals so they don't compete visually.
 function legColor(mode: string): string {
@@ -68,7 +74,7 @@ function legColor(mode: string): string {
     case "WALK": return "#6b7280";
     case "BIKE": return "#0ea5e9";
     case "BUS": return "#9ca3af";
-    case "TRAM": return "#10b981";
+    case "TRAM": return "#10b981"; // SEPTA trolley
     case "SUBWAY": return "#f97316";
     case "RAIL":
     case "REGIONAL_RAIL":
@@ -102,16 +108,14 @@ export default function Map() {
   const [bestCase, setBestCase] = useState(false);
   const [minutes, setMinutes] = useState<number>(DEFAULT_MINUTES);
   const [streetMode, setStreetMode] = useState<StreetMode>("walk");
-  const [safeStreets, setSafeStreets] = useState(false);
-  const [preciseStreets, setPreciseStreets] = useState(false);
 
   useEffect(() => {
     setDeparture(nowLocalInputValue());
   }, []);
 
   // Always-current snapshot of the query params for the click handler.
-  const queryRef = useRef({ departure, bestCase, minutes, streetMode, safeStreets, preciseStreets });
-  queryRef.current = { departure, bestCase, minutes, streetMode, safeStreets, preciseStreets };
+  const queryRef = useRef({ departure, bestCase, minutes, streetMode });
+  queryRef.current = { departure, bestCase, minutes, streetMode };
 
   const clearRoute = useCallback(() => {
     const map = mapRef.current;
@@ -157,7 +161,7 @@ export default function Map() {
     setLoading(true);
     setStopCount(null);
     try {
-      const { departure, bestCase, minutes, streetMode, safeStreets, preciseStreets } = queryRef.current;
+      const { departure, bestCase, minutes, streetMode } = queryRef.current;
       if (!departure) return;
       const time = new Date(departure).toISOString();
       const params = new URLSearchParams({
@@ -166,8 +170,6 @@ export default function Map() {
         minutes: String(minutes),
         time,
         mode: streetMode,
-        safe: String(safeStreets),
-        precise: String(preciseStreets),
       });
       if (bestCase) {
         params.set("timesCsv", bestCaseSampleTimes(departure).join(","));
@@ -189,11 +191,11 @@ export default function Map() {
       const features = data.stops.map((s) => ({
         type: "Feature" as const,
         geometry: { type: "Point" as const, coordinates: [s.lon, s.lat] },
-        properties: { duration: s.d, id: s.id, mode: s.m },
+        properties: { duration: s.d, id: s.id, mode: s.m, name: s.n ?? s.id },
       }));
       stopsSrc?.setData({ type: "FeatureCollection", features });
       setStopCount(features.length);
-      const counts: Record<StopMode, number> = { rail: 0, subway: 0, tram: 0, bus: 0, other: 0 };
+      const counts: Record<StopMode, number> = { rail: 0, subway: 0, trolley: 0, bus: 0, other: 0 };
       for (const s of data.stops) counts[s.m]++;
       setModeCounts(counts);
     } finally {
@@ -255,7 +257,12 @@ export default function Map() {
     }
 
     const res = await fetch(`/api/plan?${params}`);
-    const data = (await res.json()) as { itineraries: SlimItinerary[]; direct: SlimItinerary[]; error?: unknown };
+    const data = (await res.json()) as {
+      itineraries: SlimItinerary[];
+      direct: SlimItinerary[];
+      destinationName?: string;
+      error?: unknown;
+    };
     if (!res.ok || data.error) {
       console.error("plan error", data);
       return;
@@ -265,6 +272,9 @@ export default function Map() {
     const pool = [...data.itineraries, ...data.direct];
     if (pool.length === 0) return;
     const itin = pool.reduce((a, b) => (a.duration < b.duration ? a : b));
+    // Prefer server-reverse-geocoded name for free-coord destinations;
+    // stop clicks already pass a real stop name.
+    const resolvedName = destination.stopId ? destination.name : (data.destinationName ?? destination.name);
 
     const features = itin.legs
       .filter((l) => l.coords.length >= 2)
@@ -286,10 +296,10 @@ export default function Map() {
     destMarkerRef.current?.remove();
     destMarkerRef.current = new maplibregl.Marker({ color: "#dc2626" })
       .setLngLat([destination.lon, destination.lat])
-      .setPopup(new maplibregl.Popup({ offset: 18 }).setText(destination.name))
+      .setPopup(new maplibregl.Popup({ offset: 18 }).setText(resolvedName))
       .addTo(map);
 
-    setRoute({ destination: { name: destination.name, lat: destination.lat, lon: destination.lon }, itinerary: itin });
+    setRoute({ destination: { name: resolvedName, lat: destination.lat, lon: destination.lon }, itinerary: itin });
   }, []);
 
   useEffect(() => {
@@ -371,10 +381,10 @@ export default function Map() {
         },
       });
       map.addLayer({
-        id: "stops-tram",
+        id: "stops-trolley",
         type: "circle",
         source: "stops",
-        filter: ["==", ["get", "mode"], "tram"],
+        filter: ["==", ["get", "mode"], "trolley"],
         paint: {
           "circle-radius": 4,
           "circle-color": "#10b981",
@@ -458,18 +468,33 @@ export default function Map() {
       const geom = f.geometry as { type: string; coordinates: [number, number] };
       const [lon, lat] = geom.coordinates;
       const stopId = f.properties?.id as string | undefined;
-      showRouteTo({ lat, lon, name: stopId ?? "stop", stopId });
+      const stopName = (f.properties?.name as string | undefined) ?? stopId ?? "stop";
+      showRouteTo({ lat, lon, name: stopName, stopId });
       e.preventDefault();
     };
-    for (const layerId of ["stops-bus", "stops-tram", "stops-subway", "stops-rail"]) {
+    for (const layerId of ["stops-bus", "stops-trolley", "stops-subway", "stops-rail"]) {
       map.on("click", layerId, onStopClick);
       map.on("mouseenter", layerId, () => (map.getCanvas().style.cursor = "pointer"));
       map.on("mouseleave", layerId, () => (map.getCanvas().style.cursor = ""));
     }
 
+    // Click anywhere inside the isochrone polygon to get directions to
+    // that free coord. Stop clicks win (their handler fires first and
+    // preventDefault's); we preventDefault here too so the catch-all
+    // below doesn't stage a pending origin.
+    map.on("click", "iso-fill", (e) => {
+      if (e.defaultPrevented) return;
+      if (!clickRef.current) return; // no committed origin yet
+      showRouteTo({ lat: e.lngLat.lat, lon: e.lngLat.lng, name: "Destination" });
+      e.preventDefault();
+    });
+    map.on("mouseenter", "iso-fill", () => (map.getCanvas().style.cursor = "pointer"));
+    map.on("mouseleave", "iso-fill", () => (map.getCanvas().style.cursor = ""));
+
     map.on("click", (e) => {
-      // Stop clicks mark the event as defaultPrevented so this handler
-      // won't reset the origin every time the user picks a destination.
+      // Stop / iso-fill clicks mark the event as defaultPrevented so
+      // this handler won't reset the origin or stage a pending pin
+      // whenever the user picks a destination.
       if (e.defaultPrevented) return;
       // Intentional trigger: clicking only stages a pending origin. The
       // user confirms via the Run button or Enter. This prevents an
@@ -494,7 +519,7 @@ export default function Map() {
     // runQuery is stable (useCallback); we intentionally drive re-runs off
     // the input values rather than adding it to deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [departure, bestCase, minutes, streetMode, safeStreets, preciseStreets]);
+  }, [departure, bestCase, minutes, streetMode]);
 
   return (
     <>
@@ -547,29 +572,13 @@ export default function Map() {
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
-            checked={preciseStreets}
-            onChange={(e) => setPreciseStreets(e.target.checked)}
-          />
-          <span>Precise streets <span className="text-neutral-400">(route each cell, slower)</span></span>
-        </label>
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={safeStreets}
-            onChange={(e) => setSafeStreets(e.target.checked)}
-          />
-          <span>Prefer safer streets <span className="text-neutral-400">(detour-aware)</span></span>
-        </label>
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
             checked={bestCase}
             onChange={(e) => setBestCase(e.target.checked)}
           />
-          <span>Best-case time (scan full day)</span>
+          <span>Best-case time <span className="text-neutral-400">(scan full day, uses fast approximation)</span></span>
         </label>
         <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
-          Click map to stage an origin · Run to compute · Click a stop for routes
+          Click map to stage an origin · Run to compute · Click a stop or inside the area for routes
         </div>
         {pendingOrigin && (
           <div className="flex items-center gap-2 rounded border border-neutral-300 bg-neutral-50 px-2 py-1.5 dark:border-neutral-700 dark:bg-neutral-800">
@@ -597,12 +606,21 @@ export default function Map() {
       </div>
       {(loading || stopCount !== null) && (
         <div className="absolute bottom-4 left-4 z-10 flex flex-col gap-1 rounded-md bg-white/95 px-3 py-2 text-xs shadow dark:bg-neutral-900/95">
-          <div>{loading ? "Computing…" : `${stopCount} reachable stops in ${minutes} min`}</div>
+          <div>
+            {loading ? (
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                Routing every cell through the graph… {minutes >= 60 ? "may take ~5s" : ""}
+              </span>
+            ) : (
+              `${stopCount} reachable stops in ${minutes} min`
+            )}
+          </div>
           {!loading && modeCounts && (
             <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-neutral-600 dark:text-neutral-300">
               <ModeSwatch color="#7c3aed" label="rail" n={modeCounts.rail} />
               <ModeSwatch color="#f97316" label="subway" n={modeCounts.subway} />
-              <ModeSwatch color="#10b981" label="trolley" n={modeCounts.tram} />
+              <ModeSwatch color="#10b981" label="trolley" n={modeCounts.trolley} />
               <ModeSwatch color="#9ca3af" label="bus" n={modeCounts.bus + modeCounts.other} />
             </div>
           )}
@@ -633,7 +651,7 @@ export default function Map() {
                   style={{ backgroundColor: l.routeColor ? `#${l.routeColor}` : legColor(l.mode) }}
                 />
                 <span className="flex-1">
-                  <span className="font-mono text-[11px] uppercase text-neutral-500">{l.mode}</span>{" "}
+                  <span className="font-mono text-[11px] uppercase text-neutral-500">{displayMode(l.mode)}</span>{" "}
                   {l.routeShortName && <span className="font-semibold">{l.routeShortName}</span>}
                   {l.headsign && <span className="text-neutral-500"> → {l.headsign}</span>}
                   <span className="ml-1 text-neutral-500">({Math.round(l.duration / 60)} min)</span>

@@ -74,8 +74,8 @@ function metersPerDegLon(latDeg: number): number {
 // `m` is the coarsest mode present at this stop, ranked
 // rail > subway > tram > bus > other. Lets the client render rail-only
 // dots in a distinct color so it's obvious when transit is being used.
-export type StopMode = "rail" | "subway" | "tram" | "bus" | "other";
-export type SlimStop = { id: string; lat: number; lon: number; d: number; m: StopMode };
+export type StopMode = "rail" | "subway" | "trolley" | "bus" | "other";
+export type SlimStop = { id: string; lat: number; lon: number; d: number; m: StopMode; n?: string };
 
 export function buildIsochrone(
   origin: { lat: number; lon: number },

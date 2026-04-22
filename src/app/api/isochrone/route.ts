@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import type { Mode, Reachable } from "@motis-project/motis-client";
+import type { Feature, MultiPolygon, Polygon } from "geojson";
 import { oneToAll } from "@/lib/motis";
 import { buildIsochrone, type SlimStop, type StopMode, type StreetMode } from "@/lib/isochrone";
 import { streetGridStops } from "@/lib/streetGrid";
+import { graphIsochrone } from "@/lib/graphIsochrone";
 import { LRU } from "@/lib/cache";
 
 const MOTIS_URL = process.env.MOTIS_URL ?? "http://localhost:8080";
@@ -34,13 +36,24 @@ function streetKey(lat: number, lon: number, minutes: number, mode: StreetMode):
   return `${la},${lo},${minutes},${mode}`;
 }
 
+// Graph-isochrone polygon cache. Time matters (transit schedules vary by
+// hour), but within an hour-bucket the polygon is stable.
+const GRAPH_CACHE = new LRU<string, Feature<Polygon | MultiPolygon> | null>(200);
+function graphKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode): string {
+  const la = Math.round(lat * 1e4) / 1e4;
+  const lo = Math.round(lon * 1e4) / 1e4;
+  const hour = time.slice(0, 13);
+  return `${la},${lo},${minutes},${hour},${mode}`;
+}
+
 // Pick the "highest" mode at a stop (rail > subway > tram > bus). A bus stop
 // that's also a rail station should render as rail.
 function coarseMode(modes?: string[] | null): StopMode {
   if (!modes || modes.length === 0) return "other";
   if (modes.includes("REGIONAL_RAIL")) return "rail";
   if (modes.includes("SUBWAY")) return "subway";
-  if (modes.includes("TRAM")) return "tram";
+  // SEPTA calls these trolleys, not trams — normalize on ingest.
+  if (modes.includes("TRAM")) return "trolley";
   if (modes.includes("BUS")) return "bus";
   return "other";
 }
@@ -55,6 +68,7 @@ function projectSlim(r: Reachable): SlimStop[] {
       lon: p.place.lon,
       d: p.duration,
       m: coarseMode(p.place.modes),
+      n: p.place.name || undefined,
     });
   }
   return out;
@@ -88,6 +102,12 @@ export async function GET(req: Request) {
   // Precise-streets = replace the origin's Euclidean-circle contribution
   // with a MOTIS-routed grid of reachable cells. Adds ~100-500ms per query.
   const precise = url.searchParams.get("precise") === "true";
+  // method=graph (default): poll MOTIS one-to-many-intermodal on a dense
+  // grid so the polygon respects the transit+street graph end-to-end
+  // (rivers without bridges, rail yards, etc.). method=approx falls back
+  // to the fast Euclidean-disk approximation. best-case scans always
+  // use approx, since the cost would be 18× graph queries.
+  const method = url.searchParams.get("method") === "approx" || timesCsv ? "approx" : "graph";
 
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return NextResponse.json({ error: "lat and lon required" }, { status: 400 });
@@ -151,44 +171,92 @@ export async function GET(req: Request) {
   if (err) return NextResponse.json({ error: err }, { status: 502 });
 
   const stops = mergeSlim(hitBatches);
-  // When precise mode is on, also fan out a street-routed grid of cells
-  // around the origin. Each cell contributes a synthetic stop that the
-  // contour builder unions with the transit reach, giving a real-street
-  // polygon in the origin's walking/biking region (transit-extended
-  // areas still use the fast Euclidean fallback). Grid cells are NOT
-  // returned in the stops array — they aren't real transit stops and
-  // shouldn't be drawn as such, and the extra payload is wasteful.
-  const stopsForPoly: SlimStop[] = [...stops];
-  if (precise) {
-    const sk = streetKey(lat, lon, minutes, mode);
-    let gridStops = STREET_CACHE.get(sk);
-    if (!gridStops) {
-      gridStops = await streetGridStops({
+
+  let polygon: Feature<Polygon | MultiPolygon> | null;
+  if (method === "graph") {
+    // Bbox: tight envelope around reachable transit stops + a
+    // full-budget walking/biking buffer at each stop's own remainder.
+    // Far cheaper than covering the worst-case Regional-Rail reach, and
+    // it won't miss anything — a cell not reachable via any stop also
+    // isn't reachable period.
+    const bbox = stopsEnvelope({ lat, lon }, stops, minutes, mode);
+    const gk = graphKey(lat, lon, minutes, time, mode);
+    const cached = GRAPH_CACHE.get(gk);
+    if (cached !== undefined) {
+      polygon = cached;
+    } else {
+      polygon = await graphIsochrone({
         origin: { lat, lon },
         maxMinutes: minutes,
-        mode: mode === "bike" ? "BIKE" : "WALK",
+        mode,
+        time,
         motisUrl: MOTIS_URL,
+        bbox,
       });
-      STREET_CACHE.set(sk, gridStops);
+      GRAPH_CACHE.set(gk, polygon);
     }
-    for (const g of gridStops) stopsForPoly.push(g);
+  } else {
+    // Approximation path (fast best-case scans, or explicit method=approx).
+    // When precise is also set, a street-routed grid around the origin
+    // replaces the Euclidean origin circle.
+    const stopsForPoly: SlimStop[] = [...stops];
+    if (precise) {
+      const sk = streetKey(lat, lon, minutes, mode);
+      let gridStops = STREET_CACHE.get(sk);
+      if (!gridStops) {
+        gridStops = await streetGridStops({
+          origin: { lat, lon },
+          maxMinutes: minutes,
+          mode: mode === "bike" ? "BIKE" : "WALK",
+          motisUrl: MOTIS_URL,
+        });
+        STREET_CACHE.set(sk, gridStops);
+      }
+      for (const g of gridStops) stopsForPoly.push(g);
+    }
+    polygon = buildIsochrone({ lat, lon }, stopsForPoly, minutes, {
+      mode,
+      safe,
+      skipOriginStop: precise,
+    });
   }
-  // In precise mode, the 150m grid of MOTIS-routed cells dominates the
-  // origin-reach region. We skip the synthetic-origin zero-cost stop so
-  // the Euclidean straight-line distances to each grid cell don't beat
-  // the routed durations and collapse the street shape into a circle.
-  // Transit-stop patches still use the detour factor — their
-  // remainder-radius is Euclidean.
-  const polygon = buildIsochrone({ lat, lon }, stopsForPoly, minutes, {
-    mode,
-    safe,
-    skipOriginStop: precise,
-  });
 
   return NextResponse.json(
-    { polygon, stops, minutes, origin: { lat, lon }, mode, safe, precise },
+    { polygon, stops, minutes, origin: { lat, lon }, mode, safe, precise, method },
     { headers: { "Cache-Control": "public, max-age=60, s-maxage=300" } },
   );
+}
+
+// Bbox for graph-mode gridding. Seed from reachable-stop bbox + each
+// stop's own remaining walk/bike buffer; fall back to a conservative
+// origin-centered circle when no stops were reached.
+function stopsEnvelope(
+  origin: { lat: number; lon: number },
+  stops: SlimStop[],
+  maxMinutes: number,
+  mode: StreetMode,
+): { minLat: number; maxLat: number; minLon: number; maxLon: number } {
+  const mPerLat = 111_320;
+  const mPerLon = 111_320 * Math.cos((origin.lat * Math.PI) / 180);
+  // Ceiling m/min so the buffer is pessimistic enough to not clip real reach.
+  const mPerMin = mode === "bike" ? (22 * 1000) / 60 : (6 * 1000) / 60;
+  const originRadius = maxMinutes * mPerMin;
+  let minLat = origin.lat - originRadius / mPerLat;
+  let maxLat = origin.lat + originRadius / mPerLat;
+  let minLon = origin.lon - originRadius / mPerLon;
+  let maxLon = origin.lon + originRadius / mPerLon;
+  for (const s of stops) {
+    const remaining = maxMinutes - s.d;
+    if (remaining <= 0) continue;
+    const rM = remaining * mPerMin;
+    const dLat = rM / mPerLat;
+    const dLon = rM / mPerLon;
+    if (s.lat - dLat < minLat) minLat = s.lat - dLat;
+    if (s.lat + dLat > maxLat) maxLat = s.lat + dLat;
+    if (s.lon - dLon < minLon) minLon = s.lon - dLon;
+    if (s.lon + dLon > maxLon) maxLon = s.lon + dLon;
+  }
+  return { minLat, maxLat, minLon, maxLon };
 }
 
 async function parallelWithLimit<T, R>(
