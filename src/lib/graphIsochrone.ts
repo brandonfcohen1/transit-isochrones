@@ -59,8 +59,14 @@ export async function graphIsochrone(args: {
   times: string[];
   motisUrl: string;
   bbox?: { minLat: number; maxLat: number; minLon: number; maxLon: number };
+  // Extra reach anchors — typically reachable transit stops (e.g.
+  // Regional Rail stations) where `one-to-many-intermodal` misses the
+  // connection but `one-to-all` correctly reports the arrival time.
+  // Each anchor gets a walking-reach disk rasterized into the field
+  // at radius (maxMinutes - reachedAtMinutes) * walk-speed.
+  reachAnchors?: Array<{ lat: number; lon: number; reachedAtMinutes: number }>;
 }): Promise<Feature<Polygon | MultiPolygon> | null> {
-  const { origin, maxMinutes, mode, times, motisUrl } = args;
+  const { origin, maxMinutes, mode, times, motisUrl, reachAnchors } = args;
   if (times.length === 0) return null;
   const streetMode: Mode = mode === "bike" ? "BIKE" : "WALK";
 
@@ -164,6 +170,49 @@ export async function graphIsochrone(args: {
         if (best < durationsSec[idx]) durationsSec[idx] = best;
       }
     });
+  }
+
+  // Rasterize walking-reach disks for any extra anchors the caller
+  // supplied (typically Regional Rail stations that intermodal couldn't
+  // route to). Each anchor knows it's reachable at `reachedAtMinutes`
+  // from `oneToAll` — the remaining walking budget fans out a disk of
+  // (maxMin - reached) minutes at walking speed. Lower cost wins per
+  // cell. Using Euclidean walk here because the alternative (per-anchor
+  // streetGridStops call) adds seconds per query and this is already
+  // about filling a known MOTIS-side gap.
+  if (reachAnchors && reachAnchors.length > 0) {
+    const walkMPerMin = (5 * 1000) / 60; // 5 km/h walk
+    const detour = 1.3;
+    const mPerMin = walkMPerMin / detour;
+    for (const a of reachAnchors) {
+      const remainingMin = maxMinutes - a.reachedAtMinutes;
+      if (remainingMin <= 0) continue;
+      // Anchor position in cell grid space.
+      const ax = ((a.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * nx;
+      const ay = ((a.lat - bbox.minLat) / (bbox.maxLat - bbox.minLat)) * ny;
+      const radiusCells = (remainingMin * mPerMin) / cellM;
+      if (radiusCells <= 0) continue;
+      const r2 = radiusCells * radiusCells;
+      const ymin = Math.max(0, Math.floor(ay - radiusCells));
+      const ymax = Math.min(ny - 1, Math.ceil(ay + radiusCells));
+      const xmin = Math.max(0, Math.floor(ax - radiusCells));
+      const xmax = Math.min(nx - 1, Math.ceil(ax + radiusCells));
+      for (let y = ymin; y <= ymax; y++) {
+        const dy = y + 0.5 - ay;
+        const dyS = dy * dy;
+        if (dyS > r2) continue;
+        const rowOff = y * nx;
+        for (let x = xmin; x <= xmax; x++) {
+          const dx = x + 0.5 - ax;
+          const dS = dx * dx + dyS;
+          if (dS >= r2) continue;
+          const newCostSec = (a.reachedAtMinutes + (Math.sqrt(dS) * cellM) / mPerMin) * 60;
+          if (newCostSec < durationsSec[rowOff + x]) {
+            durationsSec[rowOff + x] = newCostSec;
+          }
+        }
+      }
+    }
   }
 
   // Build the field. Positive = reachable with that many minutes of slack.

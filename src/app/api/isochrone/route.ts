@@ -204,6 +204,16 @@ export async function GET(req: Request) {
     if (cached !== undefined) {
       polygon = cached;
     } else {
+      // MOTIS's experimental intermodal endpoint under-represents
+      // Regional Rail reach from coordinate origins (rail platforms are
+      // poorly connected to the walkable graph without osr_footpath,
+      // and enabling osr_footpath breaks intermodal elsewhere). Work
+      // around: `oneToAll` knows the correct arrival time at each rail
+      // stop, so we hand those to the graph as reach anchors and
+      // rasterize a walking-radius disk around each into the field.
+      const railAnchors = stops
+        .filter((s) => s.m === "rail" && s.d < minutes)
+        .map((s) => ({ lat: s.lat, lon: s.lon, reachedAtMinutes: s.d }));
       polygon = await graphIsochrone({
         origin: { lat, lon },
         maxMinutes: minutes,
@@ -211,6 +221,7 @@ export async function GET(req: Request) {
         times: graphTimes,
         motisUrl: MOTIS_URL,
         bbox,
+        reachAnchors: railAnchors,
       });
       GRAPH_CACHE.set(gk, polygon);
     }

@@ -45,7 +45,10 @@ function nowLocalInputValue(): string {
 // to UTC ISO — the server is TZ-agnostic.
 const BEST_CASE_START_HOUR = 5;
 const BEST_CASE_END_HOUR = 23;
-const BEST_CASE_STEP_MIN = 60;
+// Sample every 20 min. Hourly missed the Paoli line's ~30-min cadence
+// so stops only reachable by specific departures (e.g. the 12:15 train
+// to Ardmore) fell outside our window and never appeared.
+const BEST_CASE_STEP_MIN = 20;
 
 function bestCaseSampleTimes(departureLocal: string): string[] {
   const datePart = departureLocal.split("T")[0];
@@ -588,7 +591,7 @@ export default function Map() {
             checked={bestCase}
             onChange={(e) => setBestCase(e.target.checked)}
           />
-          <span>Best-case time <span className="text-neutral-400">(scan full day, uses fast approximation)</span></span>
+          <span>Best-case time <span className="text-neutral-400">(scan full day)</span></span>
         </label>
         <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
           Click map to stage an origin · Run to compute · Click a stop or inside the area for routes
