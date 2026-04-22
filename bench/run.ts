@@ -118,6 +118,7 @@ async function measurePolygon(): Promise<Sample> {
       lat: p.place.lat,
       lon: p.place.lon,
       d: p.duration,
+      m: "other",
     });
   }
   const [poly, ms] = await timed(async () =>
