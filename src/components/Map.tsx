@@ -3,15 +3,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { Feature, MultiPolygon, Polygon } from "geojson";
+import type { FeatureCollection, MultiPolygon, Polygon } from "geojson";
 import type { SlimItinerary } from "@/app/api/plan/route";
 
 type StopMode = "rail" | "subway" | "trolley" | "bus" | "other";
 type StreetMode = "walk" | "bike";
 type SlimStop = { id: string; lat: number; lon: number; d: number; m: StopMode; n?: string };
-type IsochroneEnvelope = {
-  polygon: Feature<Polygon | MultiPolygon> | null;
+type StopsOnlyResponse = {
   stops: SlimStop[];
+  minutes: number;
+  origin: { lat: number; lon: number };
+};
+type PolygonOnlyResponse = {
+  polygon: FeatureCollection<Polygon | MultiPolygon> | null;
   minutes: number;
   origin: { lat: number; lon: number };
 };
@@ -30,7 +34,7 @@ const BASEMAP_STYLE = MAPTILER_KEY
   ? `https://api.maptiler.com/maps/positron/style.json?key=${MAPTILER_KEY}`
   : "https://demotiles.maplibre.org/style.json";
 
-type IsochroneResponse = IsochroneEnvelope | { error: unknown };
+type ApiError = { error: unknown };
 
 // datetime-local inputs produce "YYYY-MM-DDTHH:MM" interpreted as local time.
 // Build one from the current wall clock so the default matches what the user sees.
@@ -40,18 +44,18 @@ function nowLocalInputValue(): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-// Best-case scan: 5am-11pm of the selected day, every 30 min. Times are built
-// in the browser's local timezone (Philadelphia for SEPTA users) and serialized
+// Best-case scan: 5am-11pm of the selected day. Times are built in the
+// browser's local timezone (Philadelphia for SEPTA users) and serialized
 // to UTC ISO — the server is TZ-agnostic.
 const BEST_CASE_START_HOUR = 5;
 const BEST_CASE_END_HOUR = 23;
-// Sample every 5 min. oneToAll is "depart at exactly this moment" — no
-// timetableView/searchWindow — so to catch a 29-min trip to Ardmore
-// that only works boarding the :12 Paoli train (walk 7 min, 0 wait,
-// ride 22 min), we need a sample within ~3 min of the ideal departure.
-// 10-min sampling still missed Ardmore / Haverford / Bryn Mawr from
-// City Hall; 5-min should land within any train's departure window.
-const BEST_CASE_STEP_MIN = 5;
+// Hourly sampling (18 times). Previously 5-min (216 times) because oneToAll
+// at the wrong instant missed Paoli-line stops. The server-side railProbe
+// (plan() with timetableView + 14h searchWindow) now covers Regional Rail
+// discovery end-to-end, so the fine-grained sampling was redundant for its
+// original purpose and just inflated MOTIS fan-out. Bus/subway reach varies
+// only modestly hour-to-hour, which hourly sampling captures fine.
+const BEST_CASE_STEP_MIN = 60;
 
 function bestCaseSampleTimes(departureLocal: string): string[] {
   const datePart = departureLocal.split("T")[0];
@@ -116,23 +120,108 @@ export default function Map() {
   // the queries are expensive (up to ~60s on cold best-case) so we
   // trigger on explicit intent.
   const [lastRanParamKey, setLastRanParamKey] = useState<string | null>(null);
+  // Two-stage loading: stops arrive fast (~100-300ms cold), polygon
+  // takes several seconds. `loading` stays true while the polygon is
+  // pending so the spinner keeps running; `stopsReady` flips as soon
+  // as the dots render.
   const [loading, setLoading] = useState(false);
+  const [stopsReady, setStopsReady] = useState(false);
+  // AbortController for the in-flight polygon fetch — if the user
+  // clicks a different origin, cancel the previous slow request so
+  // stale data never overwrites the new query.
+  const polygonAbortRef = useRef<AbortController | null>(null);
   const [stopCount, setStopCount] = useState<number | null>(null);
   const [modeCounts, setModeCounts] = useState<Record<StopMode, number> | null>(null);
   const [route, setRoute] = useState<RouteInfo | null>(null);
+  // Surfaced to the user via a banner. Cleared on next successful fetch
+  // or after 8s so a transient error doesn't stick around once the user
+  // has already moved on. Manual dismiss via the Dismiss button is
+  // still available.
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  useEffect(() => {
+    if (!errorMsg) return;
+    const t = window.setTimeout(() => setErrorMsg(null), 8000);
+    return () => window.clearTimeout(t);
+  }, [errorMsg]);
+  // Elapsed seconds during the polygon stage, so the spinner has a
+  // concrete counter instead of just a pulse. Starts when stops land,
+  // clears when polygon lands.
+  const [polygonElapsed, setPolygonElapsed] = useState<number>(0);
   // Start empty so SSR and first client render match; set to "now" after mount.
   const [departure, setDeparture] = useState<string>("");
-  const [bestCase, setBestCase] = useState(false);
+  // Default ON: single-time queries only see rail stations whose
+  // train happens to arrive in the exact sampled minute — most
+  // suburban rail (Manayunk, Chestnut Hill, Jenkintown) misses the
+  // polygon at best-case OFF. The full-day scan is only ~1-2s
+  // slower on cold so it's worth making the default.
+  const [bestCase, setBestCase] = useState(true);
   const [minutes, setMinutes] = useState<number>(DEFAULT_MINUTES);
   const [streetMode, setStreetMode] = useState<StreetMode>("walk");
+  // Transit mode filters (MOTIS enum tokens). Omitting any turns that
+  // mode off in the server-side routing. All-on means the server picks
+  // the fastest across every mode (equivalent to TRANSIT). Use as a
+  // debug knob ("is Regional Rail actually reaching X?") and as a user
+  // feature ("bus-only commute").
+  const [busEnabled, setBusEnabled] = useState(true);
+  const [subwayEnabled, setSubwayEnabled] = useState(true);
+  const [trolleyEnabled, setTrolleyEnabled] = useState(true);
+  const [railEnabled, setRailEnabled] = useState(true);
 
   useEffect(() => {
     setDeparture(nowLocalInputValue());
   }, []);
 
+  // URL-hash state sync. Hash format:
+  //   #LAT,LON/MIN/MODE/BEST/MODES
+  // e.g. #39.9526,-75.1635/30/walk/1/BSR  (bus+subway+rail, no trolley, best-case on)
+  // Missing segments = keep defaults. Restored once on mount + written
+  // whenever state changes, so refresh/share preserves the view. If the
+  // hash includes an origin, auto-run once the `departure` default is
+  // in place so the user lands on a restored polygon.
+  const hashReadRef = useRef(false);
+  const pendingRestoreRef = useRef<{ lat: number; lng: number } | null>(null);
+  useEffect(() => {
+    if (hashReadRef.current) return;
+    hashReadRef.current = true;
+    const h = (typeof window !== "undefined" && window.location.hash.slice(1)) || "";
+    if (!h) return;
+    const parts = h.split("/");
+    const [latLon, mStr, mode, best, modeFlags] = parts;
+    if (latLon && latLon.includes(",")) {
+      const [laS, loS] = latLon.split(",");
+      const la = Number(laS);
+      const lo = Number(loS);
+      if (Number.isFinite(la) && Number.isFinite(lo)) {
+        clickRef.current = { lat: la, lng: lo };
+        pendingRestoreRef.current = { lat: la, lng: lo };
+      }
+    }
+    if (mStr) { const n = Number(mStr); if (Number.isFinite(n) && n >= MIN_MINUTES && n <= MAX_MINUTES) setMinutes(n); }
+    if (mode === "walk" || mode === "bike") setStreetMode(mode);
+    if (best === "1") setBestCase(true);
+    if (modeFlags != null) {
+      setBusEnabled(modeFlags.includes("B"));
+      setSubwayEnabled(modeFlags.includes("S"));
+      setTrolleyEnabled(modeFlags.includes("T"));
+      setRailEnabled(modeFlags.includes("R"));
+    }
+  }, []);
+
+  // Write hash whenever tracked state changes. Use replaceState so we
+  // don't stuff the back-button history with every slider tick.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const flags = `${busEnabled ? "B" : ""}${subwayEnabled ? "S" : ""}${trolleyEnabled ? "T" : ""}${railEnabled ? "R" : ""}`;
+    const origin = clickRef.current ? `${clickRef.current.lat.toFixed(4)},${clickRef.current.lng.toFixed(4)}` : "";
+    const hash = origin ? `#${origin}/${minutes}/${streetMode}/${bestCase ? 1 : 0}/${flags}` : "";
+    if (window.location.hash !== hash) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
+    }
+  }, [minutes, streetMode, bestCase, busEnabled, subwayEnabled, trolleyEnabled, railEnabled, lastRanParamKey]);
+
   // Always-current snapshot of the query params for the click handler.
-  const queryRef = useRef({ departure, bestCase, minutes, streetMode });
-  queryRef.current = { departure, bestCase, minutes, streetMode };
+  const queryRef = useRef({ departure, bestCase, minutes, streetMode, busEnabled, subwayEnabled, trolleyEnabled, railEnabled });
+  queryRef.current = { departure, bestCase, minutes, streetMode, busEnabled, subwayEnabled, trolleyEnabled, railEnabled };
 
   const clearRoute = useCallback(() => {
     const map = mapRef.current;
@@ -174,36 +263,57 @@ export default function Map() {
 
     // The origin moved — any previously rendered route is now stale.
     clearRoute();
+    // Cancel any in-flight polygon fetch; its stops have also been
+    // superseded by the new origin's stops. The stops-only fetch below
+    // isn't cancelable in the same way (it's so fast it's usually done
+    // before the user can click again) — if one does overtake, the
+    // completion guard via paramKey comparison drops stale writes.
+    polygonAbortRef.current?.abort();
 
     setLoading(true);
+    setStopsReady(false);
     setStopCount(null);
-    try {
-      const { departure, bestCase, minutes, streetMode } = queryRef.current;
-      if (!departure) return;
-      const time = new Date(departure).toISOString();
-      const params = new URLSearchParams({
-        lat: String(lat),
-        lon: String(lng),
-        minutes: String(minutes),
-        time,
-        mode: streetMode,
-      });
-      if (bestCase) {
-        params.set("timesCsv", bestCaseSampleTimes(departure).join(","));
-      }
+    const { departure, bestCase, minutes, streetMode, busEnabled, subwayEnabled, trolleyEnabled, railEnabled } = queryRef.current;
+    if (!departure) { setLoading(false); return; }
+    const time = new Date(departure).toISOString();
+    const enabledModes: string[] = [];
+    if (busEnabled) enabledModes.push("BUS");
+    if (subwayEnabled) enabledModes.push("SUBWAY");
+    if (trolleyEnabled) enabledModes.push("TRAM");
+    if (railEnabled) enabledModes.push("REGIONAL_RAIL");
+    const allOn = enabledModes.length === 4;
+    const modesKey = allOn ? "T" : [...enabledModes].sort().join("+");
+    const paramKey = `${lat.toFixed(4)},${lng.toFixed(4)}|${minutes}|${streetMode}|${departure}|${bestCase ? 1 : 0}|${modesKey}`;
+    const baseParams = new URLSearchParams({
+      lat: String(lat),
+      lon: String(lng),
+      minutes: String(minutes),
+      time,
+      mode: streetMode,
+    });
+    if (bestCase) {
+      baseParams.set("timesCsv", bestCaseSampleTimes(departure).join(","));
+    }
+    if (!allOn) baseParams.set("transitModes", enabledModes.join(","));
 
-      const res = await fetch(`/api/isochrone?${params}`);
-      const data = (await res.json()) as IsochroneResponse;
+    // Stage 1 — stops. Cold ~100-300ms. Renders dots immediately so the
+    // user sees reach coverage while the polygon computes.
+    const stopsParams = new URLSearchParams(baseParams);
+    stopsParams.set("stopsOnly", "true");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`/api/isochrone?${stopsParams}`);
+      const data = (await res.json()) as StopsOnlyResponse | ApiError;
       if (!res.ok || "error" in data) {
-        console.error("isochrone error", data);
+        console.error("stops fetch error", data);
+        setErrorMsg(
+          res.status === 502
+            ? "Routing service is unavailable. Is MOTIS running?"
+            : `Stops fetch failed (HTTP ${res.status}). Try again.`,
+        );
+        setLoading(false);
         return;
       }
-
-      const isoSrc = map.getSource("iso") as maplibregl.GeoJSONSource | undefined;
-      isoSrc?.setData(
-        data.polygon ? { type: "FeatureCollection", features: [data.polygon] } : { type: "FeatureCollection", features: [] },
-      );
-
       const stopsSrc = map.getSource("stops") as maplibregl.GeoJSONSource | undefined;
       const features = data.stops.map((s) => ({
         type: "Feature" as const,
@@ -215,11 +325,91 @@ export default function Map() {
       const counts: Record<StopMode, number> = { rail: 0, subway: 0, trolley: 0, bus: 0, other: 0 };
       for (const s of data.stops) counts[s.m]++;
       setModeCounts(counts);
-      // Remember what params produced this polygon so the UI can
-      // detect when a slider/toggle makes them stale.
-      setLastRanParamKey(`${lat.toFixed(4)},${lng.toFixed(4)}|${minutes}|${streetMode}|${departure}|${bestCase ? 1 : 0}`);
-    } finally {
+      setStopsReady(true);
+      // If MOTIS snapped the origin to nothing routable (typical for
+      // airport grounds in bike mode, or a pin on open water / inside
+      // a park), there's no isochrone to compute. Surface this so the
+      // user doesn't sit staring at an empty map.
+      if (features.length === 0) {
+        setErrorMsg(`No transit reachable from this origin in ${streetMode} mode. Try a different point or switch walk/bike.`);
+        const isoSrc = map.getSource("iso") as maplibregl.GeoJSONSource | undefined;
+        isoSrc?.setData({ type: "FeatureCollection", features: [] });
+        setLoading(false);
+        return;
+      }
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      console.error("stops fetch exception", e);
+      setErrorMsg("Network error — is the dev server running?");
       setLoading(false);
+      return;
+    }
+
+    // Stage 2 — polygon. Cold ~2-5s. The oneToAll call from stage 1
+    // populated the server-side LRU, so the polygon fetch starts from a
+    // warm oneToAll and only pays the probe + graph cost.
+    const polygonParams = new URLSearchParams(baseParams);
+    polygonParams.set("polygonOnly", "true");
+    const controller = new AbortController();
+    polygonAbortRef.current = controller;
+    const polyStart = performance.now();
+    setPolygonElapsed(0);
+    const elapsedTimer = window.setInterval(() => {
+      setPolygonElapsed(Math.round((performance.now() - polyStart) / 1000));
+    }, 200);
+    try {
+      const res = await fetch(`/api/isochrone?${polygonParams}`, { signal: controller.signal });
+      const data = (await res.json()) as PolygonOnlyResponse | ApiError;
+      if (!res.ok || "error" in data) {
+        console.error("polygon fetch error", data);
+        setErrorMsg(
+          res.status === 502
+            ? "Polygon unavailable — routing service error."
+            : `Polygon fetch failed (HTTP ${res.status}).`,
+        );
+        return;
+      }
+      const isoSrc = map.getSource("iso") as maplibregl.GeoJSONSource | undefined;
+      // `data.polygon` is now a FeatureCollection of band features
+      // (1=innermost, N=outermost). Set it directly — the fill layer
+      // uses a data-driven opacity keyed on band.
+      isoSrc?.setData(data.polygon ?? { type: "FeatureCollection", features: [] });
+      // Autofit: pan/zoom so the whole polygon is visible. Without this
+      // the map stays at the user's current zoom, which often leaves a
+      // 60-min polygon looking "tiny" because only the downtown piece
+      // fits the viewport. maxZoom caps how close we go on a tiny
+      // walkshed (single 5-min origin); padding leaves room for the
+      // UI panels sitting over the corners.
+      if (data.polygon && data.polygon.features.length > 0) {
+        const bounds = new maplibregl.LngLatBounds();
+        const extend = (coords: unknown): void => {
+          if (Array.isArray(coords) && coords.length > 0 && typeof coords[0] === "number") {
+            bounds.extend(coords as [number, number]);
+            return;
+          }
+          if (Array.isArray(coords)) for (const c of coords) extend(c);
+        };
+        // Use only the OUTER band (largest) for the fit bounds.
+        const outer = data.polygon.features[data.polygon.features.length - 1];
+        extend((outer.geometry as { coordinates: unknown }).coordinates);
+        if (!bounds.isEmpty()) {
+          map.fitBounds(bounds, { padding: { top: 80, right: 320, bottom: 80, left: 320 }, maxZoom: 13, duration: 600 });
+        }
+      }
+      setLastRanParamKey(paramKey);
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      console.error("polygon fetch exception", e);
+      setErrorMsg("Network error while fetching polygon.");
+    } finally {
+      window.clearInterval(elapsedTimer);
+      // Only clear loading if we weren't superseded — otherwise the next
+      // runQuery is in charge of the spinner.
+      if (polygonAbortRef.current === controller) {
+        setLoading(false);
+        setPolygonElapsed(0);
+        polygonAbortRef.current = null;
+      }
     }
   }, [clearRoute]);
 
@@ -240,8 +430,14 @@ export default function Map() {
   // last run, the committed isochrone is stale and the UI shows a
   // Re-run affordance (the user has to ask for it — cold best-case
   // queries are 60s and we don't want to fire one per slider tick).
+  const currentEnabledModes: string[] = [];
+  if (busEnabled) currentEnabledModes.push("BUS");
+  if (subwayEnabled) currentEnabledModes.push("SUBWAY");
+  if (trolleyEnabled) currentEnabledModes.push("TRAM");
+  if (railEnabled) currentEnabledModes.push("REGIONAL_RAIL");
+  const currentModesKey = currentEnabledModes.length === 4 ? "T" : [...currentEnabledModes].sort().join("+");
   const currentParamKey = clickRef.current
-    ? `${clickRef.current.lat.toFixed(4)},${clickRef.current.lng.toFixed(4)}|${minutes}|${streetMode}|${departure}|${bestCase ? 1 : 0}`
+    ? `${clickRef.current.lat.toFixed(4)},${clickRef.current.lng.toFixed(4)}|${minutes}|${streetMode}|${departure}|${bestCase ? 1 : 0}|${currentModesKey}`
     : null;
   const isStale = clickRef.current != null && currentParamKey !== lastRanParamKey;
 
@@ -404,22 +600,35 @@ export default function Map() {
         id: "iso-outline",
         type: "line",
         source: "iso",
-        paint: { "line-color": "#1d4ed8", "line-width": 1.5 },
+        paint: { "line-color": "#1d4ed8", "line-width": 1, "line-opacity": 0.5 },
       });
 
       map.addSource("stops", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-      // Bus/other underneath — small, low-contrast so rail/subway read clearly on top.
+      // Bus/other underneath — small, low-contrast so rail/subway read
+      // clearly on top. Hidden at low zoom (whole-city view) because
+      // 4000+ bus stops form dense grid-pattern "stripes" that read as
+      // weird shading inside the isochrone. At zoom ≥12 each stop is
+      // ~60m of screen space and reads as distinct.
       map.addLayer({
         id: "stops-bus",
         type: "circle",
         source: "stops",
+        minzoom: 12,
         filter: ["match", ["get", "mode"], ["bus", "other"], true, false],
         paint: {
-          "circle-radius": 2.5,
+          "circle-radius": [
+            "interpolate", ["linear"], ["zoom"],
+            12, 1.5,
+            15, 3,
+          ],
           "circle-color": "#9ca3af",
           "circle-stroke-width": 0.5,
           "circle-stroke-color": "#ffffff",
-          "circle-opacity": 0.75,
+          "circle-opacity": [
+            "interpolate", ["linear"], ["zoom"],
+            12, 0.4,
+            14, 0.75,
+          ],
         },
       });
       map.addLayer({
@@ -554,6 +763,17 @@ export default function Map() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Auto-run when a URL hash restored an origin. Waits for both the
+  // map to be ready and `departure` (set after mount) to be populated,
+  // otherwise queryRef would have a stale empty departure.
+  useEffect(() => {
+    if (!departure) return;
+    const pending = pendingRestoreRef.current;
+    if (!pending || !mapRef.current) return;
+    pendingRestoreRef.current = null;
+    runQuery(pending.lat, pending.lng);
+  }, [departure, runQuery]);
+
   return (
     <>
       <div ref={containerRef} className="h-full w-full" />
@@ -608,8 +828,19 @@ export default function Map() {
             checked={bestCase}
             onChange={(e) => setBestCase(e.target.checked)}
           />
-          <span>Best-case time <span className="text-neutral-400">(scan full day)</span></span>
+          <span>
+            Scan full day <span className="text-neutral-400">(best train within hourly window)</span>
+          </span>
         </label>
+        <div className="flex items-start gap-2">
+          <span className="text-neutral-500">Transit</span>
+          <div className="flex flex-wrap gap-x-3 gap-y-1">
+            <ModeCheckbox color="#9ca3af" label="Bus" checked={busEnabled} onChange={setBusEnabled} />
+            <ModeCheckbox color="#f97316" label="Subway" checked={subwayEnabled} onChange={setSubwayEnabled} />
+            <ModeCheckbox color="#10b981" label="Trolley" checked={trolleyEnabled} onChange={setTrolleyEnabled} />
+            <ModeCheckbox color="#7c3aed" label="Rail" checked={railEnabled} onChange={setRailEnabled} />
+          </div>
+        </div>
         <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
           Click map to stage an origin · Run to compute · Click a stop or inside the area for routes
         </div>
@@ -652,13 +883,31 @@ export default function Map() {
           </div>
         ) : null}
       </div>
+      {errorMsg && (
+        <div className="absolute top-4 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-900 shadow dark:border-red-700 dark:bg-red-950 dark:text-red-200">
+          <span className="inline-block h-2 w-2 rounded-full bg-red-500" />
+          <span>{errorMsg}</span>
+          <button
+            type="button"
+            onClick={() => setErrorMsg(null)}
+            className="ml-2 rounded px-2 py-0.5 text-[11px] text-red-700 hover:bg-red-100 dark:text-red-300 dark:hover:bg-red-900"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {(loading || stopCount !== null) && (
         <div className="absolute bottom-4 left-4 z-10 flex flex-col gap-1 rounded-md bg-white/95 px-3 py-2 text-xs shadow dark:bg-neutral-900/95">
           <div>
-            {loading ? (
+            {loading && !stopsReady ? (
               <span className="flex items-center gap-1.5">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-                Routing every cell through the graph… {minutes >= 60 ? "may take ~5s" : ""}
+                Finding reachable stops…
+              </span>
+            ) : loading && stopsReady ? (
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                {stopCount} stops · computing polygon… {polygonElapsed > 0 && <span className="font-mono text-[10px] text-neutral-500">{polygonElapsed}s</span>}
               </span>
             ) : (
               `${stopCount} reachable stops in ${minutes} min`
@@ -720,5 +969,15 @@ function ModeSwatch({ color, label, n }: { color: string; label: string; n: numb
       <span className="font-mono tabular-nums">{n}</span>
       <span>{label}</span>
     </span>
+  );
+}
+
+function ModeCheckbox({ color, label, checked, onChange }: { color: string; label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className="flex items-center gap-1 cursor-pointer">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
+      <span>{label}</span>
+    </label>
   );
 }

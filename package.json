@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "build:routes": "bun scripts/build-routes-geojson.ts",
-    "bench": "bun bench/run.ts"
+    "bench": "bun bench/run.ts",
+    "test:coverage": "bun scripts/test-coverage.ts"
   },
   "dependencies": {
     "@motis-project/motis-client": "^2.9.2",

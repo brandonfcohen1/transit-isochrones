@@ -10,7 +10,7 @@
 //      d3-contour polygons enclose values ABOVE the threshold — so positive
 //      field, i.e. reachable area.
 import { contours } from "d3-contour";
-import type { Feature, MultiPolygon, Polygon, Position } from "geojson";
+import type { Feature, FeatureCollection, MultiPolygon, Polygon, Position } from "geojson";
 
 // Street speeds in km/h. Bike default matches MOTIS's default cycling speed
 // (~15 km/h); walk matches a typical brisk pace.
@@ -82,7 +82,7 @@ export function buildIsochrone(
   stops: SlimStop[],
   maxMinutes: number,
   opts: IsoOpts = {},
-): Feature<Polygon | MultiPolygon> | null {
+): FeatureCollection<Polygon | MultiPolygon> | null {
   const mode = opts.mode ?? "walk";
   const safe = opts.safe ?? false;
   const speedKmh = opts.speedKmh ?? speedForMode(mode);
@@ -207,25 +207,24 @@ export function buildIsochrone(
     field[i] = c === Infinity ? -Infinity : maxMinutes - c;
   }
 
-  // Contour at 0 — polygon encloses cells where field > 0, i.e. reachable.
+  // Single polygon at threshold 0 (cells with field > 0 = reachable).
   const gen = contours().size([nx, ny]).thresholds([0]);
-  const polys = gen(Array.from(field));
-  if (polys.length === 0) return null;
+  const polys = gen(field as unknown as number[]);
+  if (polys.length === 0 || !polys[0].coordinates.length) return null;
   const contour = polys[0];
-  if (!contour.coordinates.length) return null;
-
   const fromGrid = (cgx: number, cgy: number): [number, number] => [
     minLon + (cgx / nx) * (maxLon - minLon),
     minLat + (cgy / ny) * (maxLat - minLat),
   ];
-
   const coords: Position[][][] = contour.coordinates.map((poly) =>
     poly.map((ring) => ring.map(([cgx, cgy]) => fromGrid(cgx, cgy))),
   );
-
   return {
-    type: "Feature",
-    properties: { minutes: maxMinutes },
-    geometry: { type: "MultiPolygon", coordinates: coords },
+    type: "FeatureCollection",
+    features: [{
+      type: "Feature",
+      properties: { minutes: maxMinutes },
+      geometry: { type: "MultiPolygon", coordinates: coords },
+    }],
   };
 }

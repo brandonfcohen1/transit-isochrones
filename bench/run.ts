@@ -70,17 +70,24 @@ async function measureMotis(): Promise<Sample> {
   return { ms, bytes: body.byteLength, count: parsed.all?.length ?? 0 };
 }
 
-async function measureApi(bestCase: boolean, noCacheSalt?: number): Promise<Sample> {
+async function measureApi(bestCase: boolean | "fine", noCacheSalt?: number, minutes: number = MINUTES): Promise<Sample> {
   const q = new URLSearchParams({
     lat: String(LAT),
     lon: String(LON),
-    minutes: String(MINUTES),
+    minutes: String(minutes),
     time: TIME,
   });
   if (bestCase) {
     const datePart = TIME.split("T")[0];
     const times: string[] = [];
-    for (let h = 5; h < 23; h++) times.push(`${datePart}T${String(h).padStart(2, "0")}:00:00Z`);
+    // "fine" mirrors the Map.tsx prod path: 5-min sampling 5am-11pm → 216 times.
+    // Plain true stays at hourly (18 times) for the legacy compare.
+    const stepMin = bestCase === "fine" ? 5 : 60;
+    for (let h = 5; h < 23; h++) {
+      for (let m = 0; m < 60; m += stepMin) {
+        times.push(`${datePart}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00Z`);
+      }
+    }
     q.set("timesCsv", times.join(","));
   }
   // To bust the server-side LRU across trials (for cold-run measurement),
@@ -156,7 +163,11 @@ async function main() {
 
   // Each trial of *cold* api uses a different origin to dodge the LRU so we
   // measure the full MOTIS+polygon path. Warm measures LRU-hit latency.
-  let salt = 1;
+  // Seed the salt from the timestamp modulo a small band so back-to-back
+  // benches don't reuse each other's already-cached salted origins, but
+  // the resulting lat jitter stays within the SEPTA coverage area (~±10
+  // meters × salt). Max salt offset ≈ 0.02° ≈ 2km.
+  let salt = (Math.floor(Date.now() / 1000) % 100) + 1;
   const stages = [
     await runStage("motis /one-to-all (raw)", measureMotis),
     await runStage("buildIsochrone (polygon only)", measurePolygon),
@@ -164,6 +175,14 @@ async function main() {
     await runStage("/api/isochrone single — warm", () => measureApi(false, 0)),
     await runStage("/api/isochrone best-case (18) — cold", () => measureApi(true, salt++)),
     await runStage("/api/isochrone best-case (18) — warm", () => measureApi(true, 0)),
+    // The prod client uses BEST_CASE_STEP_MIN=5 → 216 samples. Measure that
+    // path too so the bench reflects what users actually wait through.
+    await runStage("/api/isochrone best-case (216) — cold", () => measureApi("fine", salt++)),
+    await runStage("/api/isochrone best-case (216) — warm", () => measureApi("fine", 0)),
+    // 60-min budget rows — adaptive cell size benefits this dimension
+    // most. Cold here tracks the 3-4x improvement we saw on the sweep.
+    await runStage("/api/isochrone 60min single — cold", () => measureApi(false, salt++, 60)),
+    await runStage("/api/isochrone 60min best-case (18) — cold", () => measureApi(true, salt++, 60)),
   ];
 
   console.log("| stage | min | p50 | p95 | max | mean | payload | stops |");

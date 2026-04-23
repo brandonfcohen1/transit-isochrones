@@ -43,3 +43,6 @@ next-env.d.ts
 # MOTIS data (downloaded GTFS + OSM + generated graph)
 /data/
 /motis-data/
+
+# Claude Code session state
+/.claude/

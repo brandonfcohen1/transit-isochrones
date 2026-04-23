@@ -1,31 +1,29 @@
 import { NextResponse } from "next/server";
 import type { Mode, Reachable } from "@motis-project/motis-client";
-import type { Feature, MultiPolygon, Polygon } from "geojson";
+import type { FeatureCollection, MultiPolygon, Polygon } from "geojson";
 import { oneToAll } from "@/lib/motis";
 import { buildIsochrone, type SlimStop, type StopMode, type StreetMode } from "@/lib/isochrone";
 import { streetGridStops } from "@/lib/streetGrid";
 import { graphIsochrone } from "@/lib/graphIsochrone";
-import { probeRailReach } from "@/lib/railProbe";
 import { LRU } from "@/lib/cache";
-
-const MOTIS_URL = process.env.MOTIS_URL ?? "http://localhost:8080";
-
-// MOTIS handles back-to-back one-to-all calls fine on its internal thread pool;
-// an earlier cap of 8 was serializing the fan-out into 4-5 batches for no reason.
-const BEST_CASE_CONCURRENCY = 64;
+import { mapMotis } from "@/lib/motisLimiter";
 
 // Cache one-to-all results by (snapped origin, minutes, hour bucket). GTFS is
 // static between feed reloads, so same inputs yield identical outputs. Repeat
 // clicks at the same origin skip MOTIS entirely.
 const CACHE = new LRU<string, SlimStop[]>(500);
 
-function cacheKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode, safe: boolean): string {
+function cacheKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode, safe: boolean, modesKey: string): string {
   // ~11m snap at Philly's latitude — well below MOTIS's 25m matching default.
   const la = Math.round(lat * 1e4) / 1e4;
   const lo = Math.round(lon * 1e4) / 1e4;
-  // Hour bucket: transit service patterns are stable within an hour.
-  const hour = time.slice(0, 13); // "2026-04-20T14"
-  return `${la},${lo},${minutes},${hour},${mode}${safe ? "S" : ""}`;
+  // Full minute precision in the key. Earlier versions bucketed to the hour,
+  // which silently collapsed the 12 samples/hour from best-case scans into
+  // one LRU slot (last-write-wins) — on any cached repeat, 11/12 samples
+  // returned the same object. Per-minute keys cost more LRU slots but make
+  // the cache faithful to what was computed.
+  const minute = time.slice(0, 16); // "2026-04-20T14:25"
+  return `${la},${lo},${minutes},${minute},${mode}${safe ? "S" : ""},${modesKey}`;
 }
 
 // Street-grid cache: independent of sample time (street graph is static).
@@ -39,25 +37,17 @@ function streetKey(lat: number, lon: number, minutes: number, mode: StreetMode):
 
 // Graph-isochrone polygon cache. Time matters (transit schedules vary by
 // hour), but within an hour-bucket the polygon is stable.
-const GRAPH_CACHE = new LRU<string, Feature<Polygon | MultiPolygon> | null>(200);
+const GRAPH_CACHE = new LRU<string, FeatureCollection<Polygon | MultiPolygon> | null>(200);
 
-// Rail-probe cache — same shape of key as the graph cache.
-// probeRailReach is the expensive path (plan() per station ≈ 40s for a
-// 14h searchWindow), so caching wins big on repeat queries in the same
-// session even if the polygon-level cache misses.
-type RailCacheEntry = Array<{ lat: number; lon: number; reachedAtMinutes: number; stopId: string; name: string }>;
-const RAIL_CACHE = new LRU<string, RailCacheEntry>(200);
-function railKey(lat: number, lon: number, minutes: number, time: string, windowSec: number): string {
+// Rail sub-sample cache. Keyed by (origin, minutes, mode, time-set).
+// Warm repeats skip the 36 × oneToAll rail-only calls entirely.
+const RAIL_SUB_CACHE = new LRU<string, SlimStop[]>(200);
+
+function graphKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode, modesKey: string): string {
   const la = Math.round(lat * 1e4) / 1e4;
   const lo = Math.round(lon * 1e4) / 1e4;
-  const hour = time.slice(0, 13);
-  return `${la},${lo},${minutes},${hour},${windowSec}`;
-}
-function graphKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode): string {
-  const la = Math.round(lat * 1e4) / 1e4;
-  const lo = Math.round(lon * 1e4) / 1e4;
-  const hour = time.slice(0, 13);
-  return `${la},${lo},${minutes},${hour},${mode}`;
+  const minute = time.slice(0, 16);
+  return `${la},${lo},${minutes},${minute},${mode},${modesKey}`;
 }
 
 // Pick the "highest" mode at a stop (rail > subway > tram > bus). A bus stop
@@ -102,10 +92,12 @@ function mergeSlim(batches: SlimStop[][]): SlimStop[] {
 
 // GET /api/isochrone?lat=..&lon=..&minutes=30&time=<iso>&mode=walk|bike&safe=true
 // For best-case: pass `timesCsv=iso1,iso2,...`. Response is a slim envelope:
-//   { polygon: Feature<MultiPolygon> | null, stops: SlimStop[], minutes, origin, mode }
-// Best-case + rail probe at 14-hour searchWindow can hit 45s cold.
-// Default route timeout trips at 30s on some Next adapters; lift it
-// explicitly so the query has room. Warm cache hits are <50ms.
+//   { polygon: FeatureCollection<MultiPolygon> | null, stops: SlimStop[], minutes, origin, mode }
+// The FeatureCollection holds 1-3 band features, each tagged with a `band`
+// property (1=innermost). Client stacks them with graduated opacity.
+// Best-case cold runs ~2-5s; longer budgets (60min) peak around 5s after
+// the adaptive cell-size pass. Default route timeout on some Next
+// adapters is 30s; lift it so cold queries have room. Warm hits <15ms.
 export const maxDuration = 60;
 
 export async function GET(req: Request) {
@@ -129,6 +121,33 @@ export async function GET(req: Request) {
   // reachable stops — rather than N graph calls (too slow) or approx
   // (low fidelity). The stops list is still the union over all times.
   const method = url.searchParams.get("method") === "approx" ? "approx" : "graph";
+  // Two-stage rendering flags:
+  //   stopsOnly=true   → return after oneToAll; skip the slow probe+graph.
+  //                      Client renders dots at ~200ms cold.
+  //   polygonOnly=true → omit `stops` from the response body (client has
+  //                      them from the stops-only fetch). Same compute
+  //                      cost, smaller payload.
+  // Both false (default) → full response, back-compat.
+  const stopsOnly = url.searchParams.get("stopsOnly") === "true";
+  const polygonOnly = url.searchParams.get("polygonOnly") === "true";
+  // transitModes=BUS,SUBWAY,TRAM,REGIONAL_RAIL (any subset). Missing or
+  // empty → default to all (TRANSIT). Used both for troubleshooting
+  // ("does Regional Rail actually reach Ardmore?") and as a real user
+  // feature ("show me bus-only reach"). We forward verbatim to MOTIS
+  // whose `transitModes` accepts the same enum; unknown tokens get
+  // silently dropped at the MOTIS side.
+  const transitModesCsv = url.searchParams.get("transitModes");
+  const ALLOWED_TRANSIT_MODES = new Set(["BUS", "SUBWAY", "TRAM", "REGIONAL_RAIL"]);
+  const transitModes: Mode[] = (() => {
+    if (!transitModesCsv) return ["TRANSIT"] as Mode[];
+    const parsed = transitModesCsv.split(",").map((s) => s.trim()).filter((s) => ALLOWED_TRANSIT_MODES.has(s));
+    return parsed.length === 0 ? ["TRANSIT"] as Mode[] : (parsed as Mode[]);
+  })();
+  const allModes = transitModes.length === 1 && transitModes[0] === "TRANSIT";
+  // Compact key fragment for cache keys so BUS-only vs SUBWAY-only don't
+  // collide. All-modes (default) normalizes to "T" so existing cache
+  // entries created before this flag existed still fit.
+  const modesKey = allModes ? "T" : [...transitModes].sort().join("+");
 
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return NextResponse.json({ error: "lat and lon required" }, { status: 400 });
@@ -142,6 +161,15 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "no sample times" }, { status: 400 });
   }
 
+  // Phase timings emitted as `Server-Timing` so devtools shows the
+  // breakdown per request. Names are short to stay within the header
+  // length most CDNs strip at.
+  const t0 = performance.now();
+  const timings: Array<{ name: string; ms: number }> = [];
+  function mark(name: string, since: number) {
+    timings.push({ name, ms: performance.now() - since });
+  }
+
   // Mode controls the street leg MOTIS routes. In bike mode the rider is
   // assumed to have a bike throughout (bike both ways), which is the most
   // optimistic "where can I get?" model and matches classical bikeability
@@ -151,7 +179,7 @@ export async function GET(req: Request) {
     one: `${lat},${lon}`,
     maxTravelTime: minutes,
     arriveBy: false,
-    transitModes: ["TRANSIT"] as Mode[],
+    transitModes,
     preTransitModes: [streetMode] as Mode[],
     postTransitModes: [streetMode] as Mode[],
     // Cap at 3 transfers — chains beyond 3 vehicles are rarely
@@ -172,7 +200,7 @@ export async function GET(req: Request) {
   const byTime = new Map<string, SlimStop[]>();
   const missTimes: string[] = [];
   for (const t of times) {
-    const k = cacheKey(lat, lon, minutes, t, mode, safe);
+    const k = cacheKey(lat, lon, minutes, t, mode, safe, modesKey);
     const hit = CACHE.get(k);
     if (hit) byTime.set(t, hit);
     else missTimes.push(t);
@@ -180,15 +208,17 @@ export async function GET(req: Request) {
 
   let err: unknown = null;
   if (missTimes.length > 0) {
-    const results = await parallelWithLimit(missTimes, BEST_CASE_CONCURRENCY, (t) =>
+    const tOneToAll = performance.now();
+    const results = await mapMotis(missTimes, (t) =>
       oneToAll({ query: { ...baseParams, time: t } }),
     );
+    mark(`ota[${missTimes.length}]`, tOneToAll);
     const firstErr = results.find((r) => r.error);
     if (firstErr?.error) err = firstErr.error;
     else {
       for (let i = 0; i < missTimes.length; i++) {
         const slim = projectSlim(results[i].data as Reachable);
-        CACHE.set(cacheKey(lat, lon, minutes, missTimes[i], mode, safe), slim);
+        CACHE.set(cacheKey(lat, lon, minutes, missTimes[i], mode, safe, modesKey), slim);
         byTime.set(missTimes[i], slim);
       }
     }
@@ -196,51 +226,124 @@ export async function GET(req: Request) {
 
   if (err) return NextResponse.json({ error: err }, { status: 502 });
 
+  // Rail-specific sub-hourly sampling. The main oneToAll above runs at
+  // every `times[]` entry (hourly for best-case). A train that departs
+  // at :12 is missed by :00/:30 samples. Instead of the old
+  // `probeRailReach` (N stations × plan() with timetableView, 14-18s
+  // cold), run rail-only oneToAll at 15-min sub-samples of the same
+  // window — tens of cheap one-to-all calls vs tens of expensive
+  // plan() calls. MOTIS returns ~50ms for rail-only one-to-all because
+  // it only walks the REGIONAL_RAIL half of the transit graph. Cached
+  // under the full base-time array so warm repeats skip MOTIS entirely.
+  //
+  // Skipped entirely if the user has toggled Regional Rail off.
+  const railEnabled = allModes || transitModes.includes("REGIONAL_RAIL" as Mode);
+  const railOnlyStops = new Map<string, SlimStop>();
+  if (railEnabled && method === "graph") {
+    const rsKey = `${Math.round(lat * 1e4) / 1e4},${Math.round(lon * 1e4) / 1e4},${minutes},${mode}|${times.join(",")}`;
+    const cached = RAIL_SUB_CACHE.get(rsKey);
+    if (cached) {
+      for (const s of cached) railOnlyStops.set(s.id, s);
+    } else {
+      const subSamples: string[] = [];
+      for (const t of times) {
+        const base = new Date(t);
+        for (const off of [15, 30, 45]) {
+          const d = new Date(base.getTime() + off * 60_000);
+          subSamples.push(d.toISOString());
+        }
+      }
+      if (subSamples.length > 0) {
+        const tRail = performance.now();
+        const railParams = { ...baseParams, transitModes: ["REGIONAL_RAIL"] as Mode[], maxTransfers: 1 };
+        const railResults = await mapMotis(subSamples, (t) =>
+          oneToAll({ query: { ...railParams, time: t } }),
+        );
+        for (const r of railResults) {
+          if (r.error || !r.data) continue;
+          for (const p of (r.data as Reachable).all ?? []) {
+            if (!p.place || p.duration == null) continue;
+            const m = coarseMode(p.place.modes);
+            if (m !== "rail") continue;
+            const id = p.place.stopId ?? `${p.place.lat.toFixed(5)},${p.place.lon.toFixed(5)}`;
+            const prev = railOnlyStops.get(id);
+            if (!prev || prev.d > p.duration) {
+              railOnlyStops.set(id, {
+                id,
+                lat: p.place.lat,
+                lon: p.place.lon,
+                d: p.duration,
+                m: "rail",
+                n: p.place.name || undefined,
+              });
+            }
+          }
+        }
+        mark(`rail-sub[${subSamples.length}/${railOnlyStops.size}]`, tRail);
+        RAIL_SUB_CACHE.set(rsKey, Array.from(railOnlyStops.values()));
+      }
+    }
+  }
+
   const hitBatches = Array.from(byTime.values());
-  const stops = mergeSlim(hitBatches);
+  const stopsBase = mergeSlim(hitBatches);
+  // Merge rail-only-sub with base stops. Prefer lower duration per id.
+  const stopsById = new Map<string, SlimStop>();
+  for (const s of stopsBase) stopsById.set(s.id, s);
+  for (const [id, s] of railOnlyStops) {
+    const prev = stopsById.get(id);
+    if (!prev || prev.d > s.d) stopsById.set(id, s);
+  }
+  const stops = Array.from(stopsById.values());
+
+  // Early return for stops-only: skip probe + graph so the client can
+  // render dots while the polygon computes in a parallel request.
+  if (stopsOnly) {
+    mark("total", t0);
+    return NextResponse.json(
+      { stops, minutes, origin: { lat, lon }, mode, safe, method, stopsOnly: true },
+      {
+        headers: {
+          "Cache-Control": "public, max-age=60, s-maxage=300",
+          "Server-Timing": timings.map((t) => `${t.name};dur=${t.ms.toFixed(1)}`).join(", "),
+        },
+      },
+    );
+  }
 
   // For the graph call, use the top-K sample times by reachable-stops
   // count. Single-time queries → just that one time. Best-case scans
-  // (18 times) → 3 representative peaks so the polygon covers the
-  // day's best reach without spending 18× MOTIS-intermodal calls.
-  // (K=3 picked empirically: K=4 costs ~14s at City Hall 30min,
-  // K=3 is ~10s, K=2 loses meaningful station-reach coverage.)
-  const GRAPH_SAMPLE_K = 3;
+  // → K representative peaks. K=2 covers AM + PM rush variance for
+  // bus/subway; rail timing variance is already covered by the
+  // rail-only 15-min sub-sampling above, so the graph intermodal
+  // doesn't need to spread across more peaks. K=3+ meaningfully
+  // raises cold latency without improving coverage.
+  const GRAPH_SAMPLE_K = 2;
   const sortedTimes = Array.from(byTime.entries())
     .sort((a, b) => b[1].length - a[1].length)
     .slice(0, Math.min(GRAPH_SAMPLE_K, byTime.size))
     .map(([t]) => t);
   const graphTimes = sortedTimes.length > 0 ? sortedTimes : [time];
 
-  let polygon: Feature<Polygon | MultiPolygon> | null;
+  let polygon: FeatureCollection<Polygon | MultiPolygon> | null;
   if (method === "graph") {
     // Cache key includes all graph-sample times so best-case unions
     // and single-time queries don't collide.
-    const gk = graphKey(lat, lon, minutes, graphTimes.join("|"), mode);
+    const gk = graphKey(lat, lon, minutes, graphTimes.join("|"), mode, modesKey);
     const cached = GRAPH_CACHE.get(gk);
     if (cached !== undefined) {
       polygon = cached;
     } else {
-      // Rail discovery: oneToAll is a single-instant query, so it
-      // misses stops whose fastest itinerary only exists if you start
-      // 10 min later to catch the next train. plan() has timetableView
-      // and optimizes the departure moment within a search window —
-      // the Paoli-line suburbs (Ardmore, Haverford, Bryn Mawr) only
-      // show up this way. Single-time queries use a 60-min window;
-      // best-case uses a full-day window so one probe per station
-      // finds the fastest trip across the whole day.
-      const railWindowSec = timesCsv ? 14 * 3600 : 3600;
-      const rk = railKey(lat, lon, minutes, graphTimes[0], railWindowSec);
-      let railAnchors = RAIL_CACHE.get(rk);
-      if (!railAnchors) {
-        railAnchors = await probeRailReach({
-          origin: { lat, lon },
-          maxMinutes: minutes,
-          time: graphTimes[0],
-          searchWindowSec: railWindowSec,
-          motisUrl: MOTIS_URL,
-        });
-        RAIL_CACHE.set(rk, railAnchors);
+      // Rail anchors = rail stops in the merged `stops` list. This now
+      // includes both the base hourly oneToAll AND the rail-only 15-min
+      // sub-samples run above, so it catches peak trains that depart at
+      // :12/:23/:38/:47-style off-clock moments. The old plan()-per-
+      // station probe was replaced by that sub-sample pass: same rail
+      // coverage, ~50× faster (0.3s vs 14-18s).
+      const railAnchors: Array<{ lat: number; lon: number; reachedAtMinutes: number; name: string; stopId: string }> = [];
+      for (const s of stops) {
+        if (s.m !== "rail") continue;
+        railAnchors.push({ lat: s.lat, lon: s.lon, reachedAtMinutes: s.d, name: s.n ?? s.id, stopId: s.id });
       }
 
       // Bbox: envelope around reachable transit stops + walking buffer
@@ -253,15 +356,17 @@ export async function GET(req: Request) {
         ...railAnchors.map((a) => ({ lat: a.lat, lon: a.lon, d: a.reachedAtMinutes })),
       ];
       const bbox = stopsEnvelope({ lat, lon }, bboxSeedStops as SlimStop[], minutes, mode);
+      const tGraph = performance.now();
       polygon = await graphIsochrone({
         origin: { lat, lon },
         maxMinutes: minutes,
         mode,
         times: graphTimes,
-        motisUrl: MOTIS_URL,
         bbox,
         reachAnchors: railAnchors,
+        transitModes,
       });
+      mark(`graph[${graphTimes.length}x]`, tGraph);
       GRAPH_CACHE.set(gk, polygon);
     }
   } else {
@@ -277,7 +382,6 @@ export async function GET(req: Request) {
           origin: { lat, lon },
           maxMinutes: minutes,
           mode: mode === "bike" ? "BIKE" : "WALK",
-          motisUrl: MOTIS_URL,
         });
         STREET_CACHE.set(sk, gridStops);
       }
@@ -290,9 +394,19 @@ export async function GET(req: Request) {
     });
   }
 
+  mark("total", t0);
+  const serverTiming = timings.map((t) => `${t.name};dur=${t.ms.toFixed(1)}`).join(", ");
+  const body = polygonOnly
+    ? { polygon, minutes, origin: { lat, lon }, mode, safe, precise, method, polygonOnly: true }
+    : { polygon, stops, minutes, origin: { lat, lon }, mode, safe, precise, method };
   return NextResponse.json(
-    { polygon, stops, minutes, origin: { lat, lon }, mode, safe, precise, method },
-    { headers: { "Cache-Control": "public, max-age=60, s-maxage=300" } },
+    body,
+    {
+      headers: {
+        "Cache-Control": "public, max-age=60, s-maxage=300",
+        "Server-Timing": serverTiming,
+      },
+    },
   );
 }
 
@@ -326,24 +440,4 @@ function stopsEnvelope(
     if (s.lon + dLon > maxLon) maxLon = s.lon + dLon;
   }
   return { minLat, maxLat, minLon, maxLon };
-}
-
-async function parallelWithLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let i = 0;
-  async function worker() {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) return;
-      results[idx] = await fn(items[idx]);
-    }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, worker),
-  );
-  return results;
 }

@@ -12,12 +12,13 @@
 // Euclidean path. Transit stops already get us most of the way there;
 // this just makes the central walking/biking region honest.
 import type { SlimStop } from "./isochrone";
+import { oneToManyPost } from "@/lib/motis";
+import { mapMotis } from "@/lib/motisLimiter";
 
 // Matches the raised `onetomany_max_many: 1024` in data/config.yml. Cap
 // exists mostly to keep per-request timeout risk bounded — walk-30min
 // and bike-30min grids both fit comfortably in one call at this size.
 const MAX_MANY_PER_REQUEST = 1024;
-const CONCURRENCY = 4;
 
 // Grid spacing in meters. Coarser than the contouring cell so the grid
 // fits in a reasonable number of MOTIS calls; the contouring step then
@@ -44,9 +45,8 @@ export async function streetGridStops(args: {
   origin: { lat: number; lon: number };
   maxMinutes: number;
   mode: MotisStreetMode;
-  motisUrl: string;
 }): Promise<SlimStop[]> {
-  const { origin, maxMinutes, mode, motisUrl } = args;
+  const { origin, maxMinutes, mode } = args;
 
   const reachM = maxMinutes * SPEED_MPMIN[mode];
   const mPerLon = metersPerDegLon(origin.lat);
@@ -76,33 +76,33 @@ export async function streetGridStops(args: {
   }
 
   const durations = new Array<number | null>(targets.length).fill(null);
-  await parallelWithLimit(batches, CONCURRENCY, async (batch, batchIdx) => {
-    const body = {
-      one: `${origin.lat};${origin.lon}`,
-      many: batch.map((t) => `${t.lat};${t.lon}`),
-      mode,
-      max: maxMinutes * 60,
-      // Allow a bit of snapping slack so grid cells that land in a
-      // backyard instead of on the street network still get matched.
-      maxMatchingDistance: 80,
-      arriveBy: false,
-    };
-    const res = await fetch(`${motisUrl}/api/v1/one-to-many`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) return;
-    const arr = (await res.json()) as Array<{ duration?: number }>;
-    const base = batchIdx * MAX_MANY_PER_REQUEST;
-    for (let i = 0; i < arr.length; i++) {
-      const d = arr[i]?.duration;
-      // MOTIS returns a very large sentinel for unreachable cells; treat
-      // anything beyond the budget as null so it doesn't contribute.
-      if (d == null || d > maxMinutes * 60 + 1) continue;
-      durations[base + i] = d;
-    }
-  });
+  await mapMotis(
+    batches.map((batch, batchIdx) => ({ batch, batchIdx })),
+    async ({ batch, batchIdx }) => {
+      const { data, error } = await oneToManyPost({
+        body: {
+          one: `${origin.lat};${origin.lon}`,
+          many: batch.map((t) => `${t.lat};${t.lon}`),
+          mode,
+          max: maxMinutes * 60,
+          // Allow a bit of snapping slack so grid cells that land in a
+          // backyard instead of on the street network still get matched.
+          maxMatchingDistance: 80,
+          arriveBy: false,
+        },
+      });
+      if (error || !data) return;
+      const arr = data as Array<{ duration?: number }>;
+      const base = batchIdx * MAX_MANY_PER_REQUEST;
+      for (let i = 0; i < arr.length; i++) {
+        const d = arr[i]?.duration;
+        // MOTIS returns a very large sentinel for unreachable cells; treat
+        // anything beyond the budget as null so it doesn't contribute.
+        if (d == null || d > maxMinutes * 60 + 1) continue;
+        durations[base + i] = d;
+      }
+    },
+  );
 
   const out: SlimStop[] = [];
   for (let i = 0; i < targets.length; i++) {
@@ -117,23 +117,5 @@ export async function streetGridStops(args: {
       m: "other",
     });
   }
-  return out;
-}
-
-async function parallelWithLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      out[i] = await fn(items[i], i);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return out;
 }
