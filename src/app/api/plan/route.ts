@@ -96,6 +96,7 @@ export async function GET(req: Request) {
       detailedLegs: true,
       detailedTransfers: true,
       useRoutedTransfers: true,
+      maxTransfers: 3,
       timetableView: false,
       // Give direct non-transit up to ~60min so bike/walk-only for short
       // trips shows up even when a transit option exists.

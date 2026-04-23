@@ -134,6 +134,9 @@ export async function graphIsochrone(args: {
         // Philly are spaced ~80-100m, and even the tightest probes —
         // Univ City, Fairmount Park — snap at 18m).
         maxMatchingDistance: 18,
+        // Cap at 3 transfers — matches a "realistic trip" envelope
+        // (chains beyond 3 vehicles are rarely actually taken).
+        maxTransfers: 3,
         useRoutedTransfers: true,
         // Street-Dijkstra cost scales sharply with these. Bike is ~6x more
         // expensive per minute than walk (bike graph is denser and faster,

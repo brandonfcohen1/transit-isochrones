@@ -133,6 +133,7 @@ export async function probeRailReach(args: {
         preTransitModes: ["WALK"],
         postTransitModes: ["WALK"],
         useRoutedTransfers: true,
+        maxTransfers: 3,
         timetableView: true,
         searchWindow,
         // Direct walk to a rail station past ~15 min is rarely the

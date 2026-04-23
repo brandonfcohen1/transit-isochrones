@@ -154,6 +154,10 @@ export async function GET(req: Request) {
     transitModes: ["TRANSIT"] as Mode[],
     preTransitModes: [streetMode] as Mode[],
     postTransitModes: [streetMode] as Mode[],
+    // Cap at 3 transfers — chains beyond 3 vehicles are rarely
+    // realistic and MOTIS's default ("hardcoded very high") can
+    // produce odd paths at budget-limit cells.
+    maxTransfers: 3,
     // Real OSM-routed transfers inside the transit graph — more accurate
     // than straight-line footpaths, especially at multi-modal hubs.
     useRoutedTransfers: true,

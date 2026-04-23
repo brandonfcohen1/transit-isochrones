@@ -109,6 +109,13 @@ export default function Map() {
   const pendingMarkerRef = useRef<maplibregl.Marker | null>(null);
   const destMarkerRef = useRef<maplibregl.Marker | null>(null);
   const [pendingOrigin, setPendingOrigin] = useState<{ lat: number; lng: number } | null>(null);
+  // Serialized snapshot of the params that produced the current
+  // isochrone; `null` means nothing has run yet. When this doesn't
+  // match the live params (slider moves, mode toggles, etc.) the UI
+  // surfaces a re-run affordance instead of auto-firing a compute —
+  // the queries are expensive (up to ~60s on cold best-case) so we
+  // trigger on explicit intent.
+  const [lastRanParamKey, setLastRanParamKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [stopCount, setStopCount] = useState<number | null>(null);
   const [modeCounts, setModeCounts] = useState<Record<StopMode, number> | null>(null);
@@ -208,6 +215,9 @@ export default function Map() {
       const counts: Record<StopMode, number> = { rail: 0, subway: 0, trolley: 0, bus: 0, other: 0 };
       for (const s of data.stops) counts[s.m]++;
       setModeCounts(counts);
+      // Remember what params produced this polygon so the UI can
+      // detect when a slider/toggle makes them stale.
+      setLastRanParamKey(`${lat.toFixed(4)},${lng.toFixed(4)}|${minutes}|${streetMode}|${departure}|${bestCase ? 1 : 0}`);
     } finally {
       setLoading(false);
     }
@@ -226,21 +236,38 @@ export default function Map() {
     runQuery(lat, lng);
   }, [pendingOrigin, runQuery]);
 
-  // Enter key commits. Only listens when a pending origin exists so the
-  // shortcut doesn't "activate" when the user is typing in the datetime
-  // input (the input swallows Enter itself, but defence in depth).
+  // What params would the next re-run use? If this doesn't match the
+  // last run, the committed isochrone is stale and the UI shows a
+  // Re-run affordance (the user has to ask for it — cold best-case
+  // queries are 60s and we don't want to fire one per slider tick).
+  const currentParamKey = clickRef.current
+    ? `${clickRef.current.lat.toFixed(4)},${clickRef.current.lng.toFixed(4)}|${minutes}|${streetMode}|${departure}|${bestCase ? 1 : 0}`
+    : null;
+  const isStale = clickRef.current != null && currentParamKey !== lastRanParamKey;
+
+  const rerunCurrent = useCallback(() => {
+    if (!clickRef.current) return;
+    runQuery(clickRef.current.lat, clickRef.current.lng);
+  }, [runQuery]);
+
+  // Enter key commits or re-runs. A pending origin takes priority; if
+  // there's no pending pin but current params diverge from the last
+  // run, Enter re-runs the committed origin. Input fields swallow
+  // Enter themselves, but the tag check is defence in depth.
   useEffect(() => {
-    if (!pendingOrigin) return;
+    const canActOnEnter = pendingOrigin != null || isStale;
+    if (!canActOnEnter) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Enter") return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       e.preventDefault();
-      commitPending();
+      if (pendingOrigin) commitPending();
+      else rerunCurrent();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pendingOrigin, commitPending]);
+  }, [pendingOrigin, isStale, commitPending, rerunCurrent]);
 
   // Fetch the fastest itinerary from origin → destination and paint its
   // legs on the map. `destination` can be a reachable-stop feature (with
@@ -527,19 +554,6 @@ export default function Map() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-run on param changes — debounced so slider drags don't fire a
-  // graph-isochrone compute for every intermediate value. 400ms is long
-  // enough to ride out a drag, short enough to feel responsive when the
-  // user lands on a value and stops.
-  useEffect(() => {
-    if (!clickRef.current) return;
-    const id = window.setTimeout(() => {
-      if (clickRef.current) runQuery(clickRef.current.lat, clickRef.current.lng);
-    }, 400);
-    return () => window.clearTimeout(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [departure, bestCase, minutes, streetMode]);
-
   return (
     <>
       <div ref={containerRef} className="h-full w-full" />
@@ -599,7 +613,7 @@ export default function Map() {
         <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
           Click map to stage an origin · Run to compute · Click a stop or inside the area for routes
         </div>
-        {pendingOrigin && (
+        {pendingOrigin ? (
           <div className="flex items-center gap-2 rounded border border-neutral-300 bg-neutral-50 px-2 py-1.5 dark:border-neutral-700 dark:bg-neutral-800">
             <span className="inline-block h-2 w-2 rounded-full bg-neutral-400" />
             <span className="flex-1 font-mono text-[11px] text-neutral-600 dark:text-neutral-300">
@@ -621,7 +635,22 @@ export default function Map() {
               Run ↵
             </button>
           </div>
-        )}
+        ) : isStale ? (
+          <div className="flex items-center gap-2 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 dark:border-amber-700 dark:bg-amber-900/30">
+            <span className="inline-block h-2 w-2 rounded-full bg-amber-500" />
+            <span className="flex-1 text-[11px] text-amber-900 dark:text-amber-200">
+              Params changed — isochrone is stale
+            </span>
+            <button
+              type="button"
+              onClick={rerunCurrent}
+              disabled={loading}
+              className="rounded bg-blue-600 px-2 py-0.5 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              Re-run ↵
+            </button>
+          </div>
+        ) : null}
       </div>
       {(loading || stopCount !== null) && (
         <div className="absolute bottom-4 left-4 z-10 flex flex-col gap-1 rounded-md bg-white/95 px-3 py-2 text-xs shadow dark:bg-neutral-900/95">
