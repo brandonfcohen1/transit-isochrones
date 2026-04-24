@@ -1,12 +1,12 @@
 // Single process-wide concurrency limiter for MOTIS calls.
 //
 // Each function that talks to MOTIS used to carry its own ad-hoc limit
-// (64 for oneToAll fan-out, 16 for intermodal, 32 for railProbe, 8 for
-// anchor-walk, 4 for streetGrid). Under a single request those limits
-// sum to >120 inflight requests against one MOTIS instance — but MOTIS
-// runs a fixed-size thread pool, so beyond the pool size new requests
-// queue at the server with zero throughput gain and cross-site limits
-// just fight each other for head-of-line slots.
+// (e.g. 64 for oneToAll fan-out, 16 for intermodal grid queries, 8 for
+// anchor walks). Under a single request those limits summed to >100
+// inflight requests against one MOTIS instance — but MOTIS runs a
+// fixed-size thread pool, so beyond the pool size new requests queue
+// at the server with zero throughput gain and cross-site limits just
+// fight each other for head-of-line slots.
 //
 // A single semaphore wrapping every MOTIS entrypoint makes the cap
 // honest and lets us tune one knob. `MOTIS_CONCURRENCY` env var
@@ -22,14 +22,22 @@ async function acquire(): Promise<void> {
     inflight++;
     return;
   }
+  // Wait for release() to hand us a slot directly. Don't increment
+  // after resuming — release already counted this slot as taken,
+  // otherwise a concurrent acquire() racing the microtask could see
+  // slack in `inflight` and over-allocate.
   await new Promise<void>((resolve) => waiters.push(resolve));
-  inflight++;
 }
 
 function release(): void {
-  inflight--;
   const next = waiters.shift();
-  if (next) next();
+  if (next) {
+    // Hand the slot to the waiter without decrementing — the count
+    // stays at LIMIT and the waiter wakes up already accounted for.
+    next();
+    return;
+  }
+  inflight--;
 }
 
 export async function withMotis<T>(fn: () => Promise<T>): Promise<T> {

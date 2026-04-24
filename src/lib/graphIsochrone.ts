@@ -14,12 +14,16 @@
 //   - Budgets past ~75 min get painful; caller should warn or coarsen further.
 import { contours } from "d3-contour";
 import type { Feature, FeatureCollection, MultiPolygon, Polygon, Position } from "geojson";
-import { buffer, cleanCoords, featureCollection, polygon as tpoly, rewind, truncate, union } from "@turf/turf";
+import buffer from "@turf/buffer";
+import cleanCoords from "@turf/clean-coords";
+import { featureCollection, polygon as tpoly } from "@turf/helpers";
+import rewind from "@turf/rewind";
+import truncate from "@turf/truncate";
+import union from "@turf/union";
 import type { Mode, OneToManyIntermodalResponse } from "@motis-project/motis-client";
-import { oneToManyIntermodalPost, oneToManyPost } from "@/lib/motis";
+import { oneToManyIntermodalPost, oneToManyPost, motisTimeoutSignal } from "@/lib/motis";
 import { mapMotis } from "@/lib/motisLimiter";
-
-export type StreetMode = "walk" | "bike";
+import type { StreetMode } from "@/lib/types";
 
 const MAX_MANY_PER_REQUEST = 1024; // matches timetable.onetomany_max_many
 
@@ -33,9 +37,10 @@ function metersPerDegLon(latDeg: number): number {
 // budgets). Constant 60m was fine at 30min (~15k cells, ~2s graph),
 // but at 60min walk the bbox grows to 40-60km wide → 400-700k cells
 // at 60m → 15-20s graph. Stepping to 100m at 60min cuts cell count
-// 3× and graph time ~linearly. The downstream polygon simplify runs
-// at ~33m tolerance so the displayed outline looks about the same
-// regardless of source cell size.
+// 3× and graph time ~linearly. Downstream turf buffer(0)/union
+// canonicalization smooths cell-grid staircase artifacts enough that
+// the displayed outline looks about the same regardless of source
+// cell size at display scale.
 function cellSizeM(mode: StreetMode, maxMinutes: number): number {
   const base = mode === "bike" ? 90 : 60;
   if (maxMinutes <= 30) return base;
@@ -119,6 +124,7 @@ export async function graphIsochrone(args: {
       const end = Math.min(targets.length, start + MAX_MANY_PER_REQUEST);
       const slice = targets.slice(start, end);
       const { data, error } = await oneToManyIntermodalPost({
+        signal: motisTimeoutSignal(),
         body: {
           one: `${origin.lat},${origin.lon}`,
           many: slice,
@@ -183,25 +189,20 @@ export async function graphIsochrone(args: {
   // implementation drew. Adds ~1-3s cold per query (cached at the
   // polygon level upstream, so repeat clicks are free).
   if (reachAnchors && reachAnchors.length > 0) {
-    // Hybrid street-routed + Euclidean-fallback anchor walks.
+    // Street-routed anchor walks.
     //
     // For each late-budget anchor (reached > half the total budget, so
     // we skip close-in city-center stations whose reach is already
-    // covered by intermodal), call MOTIS one-to-many WALK to every
-    // cell inside the Euclidean walk budget. MOTIS returns the true
-    // street-graph duration for cells it can snap and route to within
-    // the budget.
-    //
-    // If MOTIS returns at least MIN_STREET_CELLS densely connected
-    // cells, use its durations (street-accurate shape). If it returns
-    // too few (snap failures dominate), fall back to filling the disk
-    // with Euclidean * 1.3 detour so the walkshed at least renders as
-    // a clean circle rather than disappearing entirely.
+    // covered by intermodal), call MOTIS one-to-many WALK/BIKE to every
+    // cell inside the Euclidean walk/bike budget. Cells MOTIS can snap
+    // and route to within the budget get that street duration; cells it
+    // can't stay at Infinity.
     //
     // The late-budget cutoff keeps big early-budget disks (2-3km
     // radius) from ever running — those would cross rivers via the
     // ferry/bridge snap that the 80m match distance permits. Suburban
     // stations' tiny disks (< 500m) are safely away from water.
+    //
     // Disk radius uses crow-flies max (no detour), because MOTIS's
     // duration response is the real filter. Using a detour factor here
     // shrinks the candidate set too aggressively and MOTIS-reachable
@@ -216,15 +217,9 @@ export async function graphIsochrone(args: {
     const walkSpeedMPerMin = (5 * 1000) / 60; // 5 km/h
     const bikeSpeedMPerMin = (15 * 1000) / 60; // 15 km/h
     const effectiveMPerMin = mode === "bike" ? bikeSpeedMPerMin : walkSpeedMPerMin;
-    const anchorMotisMode: Mode = mode === "bike" ? "BIKE" : "WALK";
     const mLat = M_PER_DEG_LAT;
     const mLon = metersPerDegLon(origin.lat);
     const anchorBudgetCutoff = maxMinutes / 2;
-    // A disk with radius r cells has ~π·r² cells inside. At r≈2.8
-    // (2-min budget on 60m cells) that's ~24 cells. We want at least
-    // a quarter of them for a "dense enough" classification — roughly
-    // a 3-cell contiguous blob. Below that, fall back to Euclidean.
-    const MIN_STREET_CELLS = 6;
 
     const fromGridLatLon = (x: number, y: number): [number, number] => [
       bbox.minLat + ((y + 0.5) / ny) * (bbox.maxLat - bbox.minLat),
@@ -243,11 +238,10 @@ export async function graphIsochrone(args: {
       const xmin = Math.max(0, Math.floor(((a.lon - radiusM / mLon) - bbox.minLon) / (bbox.maxLon - bbox.minLon) * nx));
       const xmax = Math.min(nx - 1, Math.ceil(((a.lon + radiusM / mLon) - bbox.minLon) / (bbox.maxLon - bbox.minLon) * nx));
 
-      // Collect candidate cells (inside the Euclidean disk) and their
-      // target coords for MOTIS. Keep each cell's Euclidean walkSec as
-      // the fallback if MOTIS doesn't return a time for it. Cells that
-      // land in water are excluded — otherwise a disk around a
-      type Target = { idx: number; coord: string; euclM: number };
+      // Collect candidate cells (inside the Euclidean disk) with their
+      // lat/lon (for routing) and Euclidean distance (for the detour-
+      // reject filter below).
+      type Target = { idx: number; lat: number; lon: number; euclM: number };
       const targets: Target[] = [];
       for (let y = ymin; y <= ymax; y++) {
         const [cellLat] = fromGridLatLon(0, y);
@@ -261,24 +255,25 @@ export async function graphIsochrone(args: {
           if (distM2 > radiusM2) continue;
           targets.push({
             idx: y * nx + x,
-            coord: `${cellLat.toFixed(5)};${cellLon.toFixed(5)}`,
+            lat: cellLat,
+            lon: cellLon,
             euclM: Math.sqrt(distM2),
           });
         }
       }
       if (targets.length === 0) return;
 
-      // MOTIS street-routing pass. Match distance + detour-ratio filter
-      // work together: the match needs to be loose enough to capture
-      // suburban streets (which are often 60-80m from a grid cell center
-      // in outer PA towns like Bensalem — probed: at 40m only 1% of
-      // cells near Eddington station reach; at 80m, 45%+ reach). But
-      // looser match also lets cells over water snap to walkable edges
-      // hundreds of meters around, inflating the walkshed into rivers.
+      // MOTIS one-to-many street routing. Match distance + detour-ratio
+      // filter work together: the match needs to be loose enough to
+      // capture suburban streets (often 60-80m from a grid cell center
+      // in outer PA towns — at 40m only 1% of cells near Eddington
+      // station reach; at 80m, 45%+ reach). But looser match also lets
+      // cells over water snap to walkable edges hundreds of meters
+      // around, inflating the walkshed into rivers.
       //
-      // Solution: use an 80m match for coverage, then reject cells where
-      // MOTIS's routed walk distance exceeds ~4× the Euclidean distance
-      // to the anchor. `withDistance=true` makes MOTIS return the routed
+      // Solution: 80m match for coverage, then reject cells whose
+      // routed distance exceeds ~4× the Euclidean distance to the
+      // anchor. `withDistance=true` tells MOTIS to return the routed
       // distance alongside duration.
       //
       // Threshold 4× balances two measured regimes:
@@ -291,13 +286,15 @@ export async function graphIsochrone(args: {
       // leaving stations as isolated single-cell polygons.
       const DETOUR_REJECT_RATIO = 4.0;
       const streetDurations = new Array<number | undefined>(targets.length);
+      const motisMode: Mode = mode === "bike" ? "BIKE" : "WALK";
       for (let start = 0; start < targets.length; start += MAX_MANY_PER_REQUEST) {
         const slice = targets.slice(start, start + MAX_MANY_PER_REQUEST);
         const { data, error } = await oneToManyPost({
+          signal: motisTimeoutSignal(),
           body: {
             one: `${a.lat};${a.lon}`,
-            many: slice.map((t) => t.coord),
-            mode: anchorMotisMode,
+            many: slice.map((t) => `${t.lat};${t.lon}`),
+            mode: motisMode,
             max: Math.ceil(remainingMin * 60 * 1.5),
             maxMatchingDistance: 80,
             withDistance: true,
@@ -336,23 +333,33 @@ export async function graphIsochrone(args: {
     await mapMotis(reachAnchors, rasterAnchor);
 
     // Guarantee each reachable anchor has a visible footprint around
-    // its coord. A single-cell force-write produced degenerate polygons
-    // (d3-contour emits a zero-area contour when a single positive
-    // cell is surrounded by -Inf) — stations at d=maxMinutes with no
-    // walk budget would disappear entirely. A 3×3 block always emits
-    // a clean polygon. Footprint is only 180-360m (depending on cell
-    // size), so it's a minimum visual indicator, not an inflated
-    // walkshed; anchor walks overlay bigger polygons on top for any
-    // station with actual budget.
+    // its coord. A single-cell force-write produced degenerate
+    // polygons (d3-contour emits a zero-area contour when a single
+    // positive cell sits alone in -Inf) — stations at d≈maxMinutes
+    // with no remaining walk budget would disappear entirely.
+    //
+    // Rasterize a small filled disk (~1.5-cell radius) so the marching
+    // squares output is round-ish rather than the obvious square a
+    // 3×3 box produced. After the downstream buffer smooth, these
+    // read as little circles at stations where transit brought you
+    // right to the budget limit — a minimum visual indicator, not an
+    // inflated walkshed. Anchor-walk rasterization overlays bigger
+    // shapes on top for any station with actual remaining budget.
+    const anchorDiskRadiusCells = 1.5;
+    const anchorR2 = anchorDiskRadiusCells * anchorDiskRadiusCells;
     for (const a of reachAnchors) {
-      const cx = Math.floor(((a.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * nx);
-      const cy = Math.floor(((a.lat - bbox.minLat) / (bbox.maxLat - bbox.minLat)) * ny);
+      const cx = ((a.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * nx;
+      const cy = ((a.lat - bbox.minLat) / (bbox.maxLat - bbox.minLat)) * ny;
       const reachedSec = a.reachedAtMinutes * 60;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const x = cx + dx;
-          const y = cy + dy;
-          if (x < 0 || x >= nx || y < 0 || y >= ny) continue;
+      const xmin = Math.max(0, Math.floor(cx - anchorDiskRadiusCells));
+      const xmax = Math.min(nx - 1, Math.ceil(cx + anchorDiskRadiusCells));
+      const ymin = Math.max(0, Math.floor(cy - anchorDiskRadiusCells));
+      const ymax = Math.min(ny - 1, Math.ceil(cy + anchorDiskRadiusCells));
+      for (let y = ymin; y <= ymax; y++) {
+        const dy = y + 0.5 - cy;
+        for (let x = xmin; x <= xmax; x++) {
+          const dx = x + 0.5 - cx;
+          if (dx * dx + dy * dy > anchorR2) continue;
           const idx = y * nx + x;
           if (reachedSec < durationsSec[idx]) durationsSec[idx] = reachedSec;
         }
@@ -438,42 +445,43 @@ export async function graphIsochrone(args: {
   if (kept.length === 0) return null;
 
   // Standard raster-to-vector cleanup:
-  //   1. rewind — d3-contour outputs grid-space rings (y-down); after
+  //   1. truncate to 5-decimal precision (~1m) — d3-contour emits
+  //      floating-point noise at cell-grid boundaries; snapping
+  //      defeats near-coincident vertices that later cause
+  //      self-intersections.
+  //   2. rewind — d3-contour outputs grid-space rings (y-down); after
   //      converting to lat/lon (y-up) the winding flips, producing
   //      CW outer / CCW hole rings. GeoJSON + MapLibre need the
   //      opposite (right-hand rule) or fills render inside-out.
-  //   2. cleanCoords — remove duplicate consecutive vertices.
-  //   3. unkinkPolygon — d3-contour occasionally produces
-  //      self-intersecting rings at cell-boundary touches (ring
-  //      crosses itself). MapLibre's fill-rule then stacks the fill
-  //      twice at the overlap, producing darker strips that look
-  //      like separate polygon overlays. unkinkPolygon splits each
-  //      self-intersecting polygon into valid, non-self-intersecting
-  //      sub-polygons.
+  //   3. cleanCoords — remove duplicate consecutive vertices.
+  //   4. buffer(0) + union-fold (below) — canonicalize geometry via
+  //      martinez polygon-clipping: splits any remaining
+  //      self-intersecting rings, merges accidentally-overlapping
+  //      sub-polygons, produces a single spec-clean MultiPolygon
+  //      that MapLibre renders without overlap-strip / touching-ring
+  //      artifacts.
   const feat: Feature<MultiPolygon> = {
     type: "Feature",
     properties: { minutes: maxMinutes, method: "graph" },
     geometry: { type: "MultiPolygon", coordinates: kept },
   };
   let clean: Feature<Polygon | MultiPolygon> = feat;
-  // truncate to 5-decimal precision (~1m) first — d3-contour emits
-  // floating-point noise at cell-grid boundaries that causes near-
-  // coincident vertices, which in turn cause self-intersections
-  // after subsequent passes. Snapping to 1m defeats this.
   try { clean = truncate(clean, { precision: 5, mutate: true }) as Feature<Polygon | MultiPolygon>; }
   catch { /* keep feat */ }
   try { clean = rewind(clean, { reverse: false, mutate: true }) as Feature<Polygon | MultiPolygon>; }
   catch { /* keep clean */ }
   try { clean = cleanCoords(clean, { mutate: true }) as Feature<Polygon | MultiPolygon>; }
   catch { /* keep clean */ }
-
-  // buffer(0) + union-fold canonicalize the geometry through
-  // martinez polygon-clipping: splits self-intersecting rings, merges
-  // any accidentally-overlapping sub-polygons, and produces a single
-  // spec-clean MultiPolygon. This is what reliably renders in
-  // MapLibre without the overlap-strip / touching-ring artifacts.
   try {
-    const buffered = buffer(clean, 0, { units: "meters" });
+    // Small positive buffer softens the marching-squares cell-boundary
+    // staircase into a rounded outline. Also pulls in the buffer(0)
+    // canonicalization side-effect (splits self-intersecting rings,
+    // merges overlapping sub-polygons via jsts' polygon-clipping).
+    // 10 m is invisible relative to polygon area (~5 km radius) but
+    // takes the edges from pixelated to smooth. `steps: 4` keeps the
+    // vertex count down — at 10 m radius even 4 arc steps render as
+    // a soft round corner at display zoom.
+    const buffered = buffer(clean, 10, { units: "meters", steps: 4 });
     if (buffered && buffered.geometry) clean = buffered as Feature<Polygon | MultiPolygon>;
   } catch { /* keep clean */ }
 

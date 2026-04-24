@@ -37,6 +37,20 @@ type CaseSpec = {
 
 const APP_URL = process.env.APP_URL ?? "http://localhost:3000";
 
+// Pick a test date 7 days out so it stays inside MOTIS's num_days
+// timetable window regardless of when the test runs. Anchor at 14:00 UTC
+// (mid-morning ET, weekday service assumed). Hardcoded dates went stale
+// after ~mid-June 2026 when the rolling 60-day calendar moved past them.
+function pickTestDate(): string {
+  const d = new Date(Date.now() + 7 * 86_400_000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+const TEST_DATE = pickTestDate();
+const TEST_TIME_UTC = `${TEST_DATE}T14:00:00Z`;
+
 const CASES: CaseSpec[] = [
   {
     // City Hall, best-case 30 min walk. The cornerstone test — almost
@@ -129,6 +143,7 @@ type FC = { type: "FeatureCollection"; features: Feature[] };
 
 function hourlyTimesCsv(date: string): string {
   const out: string[] = [];
+  // 12 hourly samples; stays under the server's 24-entry cap.
   for (let h = 10; h < 22; h++) out.push(`${date}T${String(h).padStart(2, "0")}:00:00Z`);
   return out.join(",");
 }
@@ -173,9 +188,9 @@ async function runCase(spec: CaseSpec): Promise<{ pass: boolean; failures: strin
     lat: String(lat),
     lon: String(lon),
     minutes: String(spec.minutes),
-    time: "2026-04-23T14:00:00Z",
+    time: TEST_TIME_UTC,
   });
-  if (spec.bestCase) q.set("timesCsv", hourlyTimesCsv("2026-04-23"));
+  if (spec.bestCase) q.set("timesCsv", hourlyTimesCsv(TEST_DATE));
 
   const res = await fetch(`${APP_URL}/api/isochrone?${q}`);
   if (!res.ok) {

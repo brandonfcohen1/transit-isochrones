@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import type { Itinerary, Leg, Mode, PlanResponse } from "@motis-project/motis-client";
-import { plan, reverseGeocode } from "@/lib/motis";
+import { plan, reverseGeocode, motisTimeoutSignal } from "@/lib/motis";
 import { decodePolyline } from "@/lib/polyline";
+import { rateLimit } from "@/lib/rateLimit";
 
 // Slim leg shape — client needs geometry + enough to color/label the segment.
 type SlimLeg = {
@@ -56,7 +57,21 @@ function slimItinerary(it: Itinerary): SlimItinerary {
 // Returns { itineraries: SlimItinerary[], direct: SlimItinerary[] }.
 // Itineraries include full leg geometry (decoded polyline → [lon,lat] coords)
 // so the client can draw them as GeoJSON without further processing.
+function inCoverage(lat: number, lon: number): boolean {
+  return lat >= 39.3 && lat <= 40.5 && lon >= -76.0 && lon <= -74.4;
+}
+
 export async function GET(req: Request) {
+  // Higher cap than /api/isochrone — clicking destinations inside an
+  // existing polygon is a more common interaction and each call is
+  // cheap (no fan-out, one plan).
+  const rl = rateLimit(req, { capacity: 60, refillPerSec: 1 });
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "rate limited" },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfter) } },
+    );
+  }
   const url = new URL(req.url);
   const fromLat = Number(url.searchParams.get("fromLat"));
   const fromLon = Number(url.searchParams.get("fromLon"));
@@ -64,13 +79,20 @@ export async function GET(req: Request) {
   const toLon = Number(url.searchParams.get("toLon"));
   const toStop = url.searchParams.get("toStop");
   const time = url.searchParams.get("time") ?? new Date().toISOString();
-  const mode = (url.searchParams.get("mode") ?? "walk") as "walk" | "bike";
+  const modeParam = url.searchParams.get("mode");
+  const mode: "walk" | "bike" = modeParam === "bike" ? "bike" : "walk";
 
   if (!Number.isFinite(fromLat) || !Number.isFinite(fromLon)) {
     return NextResponse.json({ error: "fromLat/fromLon required" }, { status: 400 });
   }
+  if (!inCoverage(fromLat, fromLon)) {
+    return NextResponse.json({ error: "origin outside coverage area" }, { status: 400 });
+  }
   if (!toStop && (!Number.isFinite(toLat) || !Number.isFinite(toLon))) {
     return NextResponse.json({ error: "toLat/toLon or toStop required" }, { status: 400 });
+  }
+  if (!toStop && !inCoverage(toLat, toLon)) {
+    return NextResponse.json({ error: "destination outside coverage area" }, { status: 400 });
   }
 
   // Non-transit modes for first/last mile. For bike, MOTIS will route on
@@ -84,6 +106,7 @@ export async function GET(req: Request) {
   // MOTIS labels unknown coords as "END" in the itinerary, so we patch
   // the client-facing name with the closest named place.
   const planPromise = plan({
+    signal: motisTimeoutSignal(),
     query: {
       fromPlace,
       toPlace,
@@ -105,7 +128,7 @@ export async function GET(req: Request) {
   });
   const reverseGeocodePromise: Promise<string | undefined> = toStop
     ? Promise.resolve(undefined)
-    : reverseGeocode({ query: { place: `${toLat},${toLon}` } })
+    : reverseGeocode({ signal: motisTimeoutSignal(), query: { place: `${toLat},${toLon}` } })
         .then((r) => {
           const hits = r.data as Array<{ name?: string }> | undefined;
           return hits?.[0]?.name;
@@ -113,7 +136,10 @@ export async function GET(req: Request) {
         .catch(() => undefined);
 
   const [planRes, destName] = await Promise.all([planPromise, reverseGeocodePromise]);
-  if (planRes.error) return NextResponse.json({ error: planRes.error }, { status: 502 });
+  if (planRes.error) {
+    console.error("plan error", planRes.error);
+    return NextResponse.json({ error: "routing service error" }, { status: 502 });
+  }
   const body = planRes.data as PlanResponse;
   return NextResponse.json(
     {

@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
 // Benchmark harness for the isochrone stack.
-// Measures four stages end-to-end so before/after comparisons are attributable:
+// Measures three stages end-to-end so before/after comparisons are attributable:
 //   1. MOTIS raw /one-to-all (C++ compute + transport)
 //   2. /api/isochrone single-time (MOTIS + merge + JSON ship)
-//   3. /api/isochrone best-case (18 MOTIS calls fanned out)
-//   4. buildIsochrone (grid + marching-squares contour over N stops)
+//   3. /api/isochrone best-case (MOTIS fan-out + polygon)
 //
 // Run:   bun run bench        # or: bun bench/run.ts
 // Flags: --trials=N (default 5)   --save=path (default bench/results/<ts>.json)
@@ -13,8 +12,9 @@
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildIsochrone, type SlimStop } from "../src/lib/isochrone";
 import type { Reachable } from "@motis-project/motis-client";
+
+type SlimStop = { id: string; lat: number; lon: number; d: number };
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MOTIS_URL = process.env.MOTIS_URL ?? "http://localhost:8080";
@@ -43,7 +43,11 @@ function stats(samples: Sample[]) {
   const sum = ms.reduce((a, b) => a + b, 0);
   const bytes = samples[0]?.bytes;
   const count = samples[0]?.count;
-  return { min: ms[0], p50: p(0.5), p95: p(0.95), max: ms[ms.length - 1], mean: sum / ms.length, bytes, count };
+  // Skip p95 when n < 20 — with 5 trials `ms[floor(0.95*5)] = ms[4] = max`
+  // so the stat is indistinguishable from `max` and misleads anyone
+  // reading the table. Restored automatically at higher trial counts.
+  const p95 = ms.length >= 20 ? p(0.95) : null;
+  return { min: ms[0], p50: p(0.5), p95, max: ms[ms.length - 1], mean: sum / ms.length, bytes, count };
 }
 
 async function timed<T>(fn: () => Promise<T>): Promise<[T, number]> {
@@ -70,7 +74,7 @@ async function measureMotis(): Promise<Sample> {
   return { ms, bytes: body.byteLength, count: parsed.all?.length ?? 0 };
 }
 
-async function measureApi(bestCase: boolean | "fine", noCacheSalt?: number, minutes: number = MINUTES): Promise<Sample> {
+async function measureApi(bestCase: boolean, noCacheSalt?: number, minutes: number = MINUTES): Promise<Sample> {
   const q = new URLSearchParams({
     lat: String(LAT),
     lon: String(LON),
@@ -80,21 +84,21 @@ async function measureApi(bestCase: boolean | "fine", noCacheSalt?: number, minu
   if (bestCase) {
     const datePart = TIME.split("T")[0];
     const times: string[] = [];
-    // "fine" mirrors the Map.tsx prod path: 5-min sampling 5am-11pm → 216 times.
-    // Plain true stays at hourly (18 times) for the legacy compare.
-    const stepMin = bestCase === "fine" ? 5 : 60;
+    // Hourly sampling from 5am-11pm = 18 times, matching the prod client.
+    // Earlier 5-min (216) sampling was superseded by rail sub-sampling on
+    // the server; removed to keep the bench aligned with the actual prod
+    // path (also now caps at 24 timesCsv entries).
     for (let h = 5; h < 23; h++) {
-      for (let m = 0; m < 60; m += stepMin) {
-        times.push(`${datePart}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00Z`);
-      }
+      times.push(`${datePart}T${String(h).padStart(2, "0")}:00:00Z`);
     }
     q.set("timesCsv", times.join(","));
   }
   // To bust the server-side LRU across trials (for cold-run measurement),
-  // vary the origin by a few meters per trial — the cache key snaps to 4
-  // decimals (~11m), so shifting by 20m guarantees a cache miss.
+  // vary the origin by enough to escape the cache's 3-decimal snap grid
+  // (~110 m). At 0.002° ≈ 220 m per salt step, salts 1..5 all land in
+  // distinct buckets.
   if (noCacheSalt) {
-    const jitter = noCacheSalt * 0.0002;
+    const jitter = noCacheSalt * 0.002;
     q.set("lat", String(LAT + jitter));
   }
   const [res, ms] = await timed(() => fetch(`${APP_URL}/api/isochrone?${q}`));
@@ -102,37 +106,6 @@ async function measureApi(bestCase: boolean | "fine", noCacheSalt?: number, minu
   if (!res.ok) throw new Error(`api http ${res.status}: ${new TextDecoder().decode(body).slice(0, 200)}`);
   const parsed = JSON.parse(new TextDecoder().decode(body)) as { stops?: SlimStop[] };
   return { ms, bytes: body.byteLength, count: parsed.stops?.length ?? 0 };
-}
-
-async function measurePolygon(): Promise<Sample> {
-  // Fetch once outside the measured region so polygon timing is isolated.
-  const q = new URLSearchParams({
-    one: `${LAT},${LON}`,
-    maxTravelTime: String(MINUTES),
-    arriveBy: "false",
-    transitModes: "TRANSIT",
-    preTransitModes: "WALK",
-    postTransitModes: "WALK",
-    time: TIME,
-  });
-  const res = await fetch(`${MOTIS_URL}/api/v1/one-to-all?${q}`);
-  const reachable = (await res.json()) as Reachable;
-  const stops: SlimStop[] = [];
-  for (const p of reachable.all ?? []) {
-    if (!p.place || p.duration == null) continue;
-    stops.push({
-      id: p.place.stopId ?? `${p.place.lat.toFixed(5)},${p.place.lon.toFixed(5)}`,
-      lat: p.place.lat,
-      lon: p.place.lon,
-      d: p.duration,
-      m: "other",
-    });
-  }
-  const [poly, ms] = await timed(async () =>
-    buildIsochrone({ lat: LAT, lon: LON }, stops, MINUTES),
-  );
-  const bytes = poly ? new TextEncoder().encode(JSON.stringify(poly)).byteLength : 0;
-  return { ms, bytes, count: stops.length };
 }
 
 async function runStage(name: string, fn: () => Promise<Sample>, trials = TRIALS) {
@@ -170,27 +143,29 @@ async function main() {
   let salt = (Math.floor(Date.now() / 1000) % 100) + 1;
   const stages = [
     await runStage("motis /one-to-all (raw)", measureMotis),
-    await runStage("buildIsochrone (polygon only)", measurePolygon),
     await runStage("/api/isochrone single — cold", () => measureApi(false, salt++)),
     await runStage("/api/isochrone single — warm", () => measureApi(false, 0)),
     await runStage("/api/isochrone best-case (18) — cold", () => measureApi(true, salt++)),
     await runStage("/api/isochrone best-case (18) — warm", () => measureApi(true, 0)),
-    // The prod client uses BEST_CASE_STEP_MIN=5 → 216 samples. Measure that
-    // path too so the bench reflects what users actually wait through.
-    await runStage("/api/isochrone best-case (216) — cold", () => measureApi("fine", salt++)),
-    await runStage("/api/isochrone best-case (216) — warm", () => measureApi("fine", 0)),
     // 60-min budget rows — adaptive cell size benefits this dimension
-    // most. Cold here tracks the 3-4x improvement we saw on the sweep.
+    // most. Cold here tracks the 3-4x improvement seen on the sweep.
     await runStage("/api/isochrone 60min single — cold", () => measureApi(false, salt++, 60)),
     await runStage("/api/isochrone 60min best-case (18) — cold", () => measureApi(true, salt++, 60)),
   ];
 
-  console.log("| stage | min | p50 | p95 | max | mean | payload | stops |");
-  console.log("|---|---:|---:|---:|---:|---:|---:|---:|");
+  // p95 omitted when n < 20 (would otherwise equal max and mislead).
+  const showP95 = stages.some((s) => s.p95 != null);
+  const header = showP95
+    ? "| stage | min | p50 | p95 | max | mean | payload | stops |"
+    : "| stage | min | p50 | max | mean | payload | stops |";
+  const sep = showP95 ? "|---|---:|---:|---:|---:|---:|---:|---:|" : "|---|---:|---:|---:|---:|---:|---:|";
+  console.log(header);
+  console.log(sep);
   for (const s of stages) {
-    console.log(
-      `| ${s.name} | ${fmt(s.min)} | ${fmt(s.p50)} | ${fmt(s.p95)} | ${fmt(s.max)} | ${fmt(s.mean)} | ${kb(s.bytes)} | ${s.count ?? "-"} |`,
-    );
+    const row = showP95
+      ? `| ${s.name} | ${fmt(s.min)} | ${fmt(s.p50)} | ${s.p95 != null ? fmt(s.p95) : "—"} | ${fmt(s.max)} | ${fmt(s.mean)} | ${kb(s.bytes)} | ${s.count ?? "-"} |`
+      : `| ${s.name} | ${fmt(s.min)} | ${fmt(s.p50)} | ${fmt(s.max)} | ${fmt(s.mean)} | ${kb(s.bytes)} | ${s.count ?? "-"} |`;
+    console.log(row);
   }
 
   const outDir = join(ROOT, "bench", "results");

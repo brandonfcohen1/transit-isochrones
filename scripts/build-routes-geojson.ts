@@ -58,6 +58,15 @@ async function readCsv(path: string): Promise<{ header: string[]; rows: string[]
   return { header, rows };
 }
 
+// Fail loud when a required GTFS column is missing. Silent `indexOf` → -1
+// would otherwise produce `undefined` cells that serialize as "#undefined"
+// route colors or crash later lookups.
+function requiredIdx(header: string[], col: string, feed: string, file: string): number {
+  const i = header.indexOf(col);
+  if (i < 0) throw new Error(`${feed}/${file}: missing required column "${col}"`);
+  return i;
+}
+
 const round = (n: number) => Math.round(n * 1e5) / 1e5; // ~1m precision
 
 rmSync(TMP, { recursive: true, force: true });
@@ -76,21 +85,22 @@ for (const zipName of FEEDS) {
   // routes.txt — keep only allowed types
   {
     const { header, rows } = await readCsv(join(dest, "routes.txt"));
-    const idx = (n: string) => header.indexOf(n);
-    const iId = idx("route_id"),
-      iShort = idx("route_short_name"),
-      iLong = idx("route_long_name"),
-      iType = idx("route_type"),
-      iColor = idx("route_color");
+    const iId = requiredIdx(header, "route_id", feed, "routes.txt");
+    const iShort = requiredIdx(header, "route_short_name", feed, "routes.txt");
+    const iLong = requiredIdx(header, "route_long_name", feed, "routes.txt");
+    const iType = requiredIdx(header, "route_type", feed, "routes.txt");
+    // route_color is technically optional in GTFS — fall back to grey.
+    const iColor = header.indexOf("route_color");
     for (const r of rows) {
       const type = Number(r[iType]);
       if (!ALLOWED_TYPES.has(type)) continue;
+      const rawColor = iColor >= 0 ? r[iColor] : "";
       routes.set(`${feed}:${r[iId]}`, {
         id: r[iId],
         short: r[iShort] || "",
         long: r[iLong] || "",
         type,
-        color: `#${r[iColor] || "888888"}`,
+        color: `#${rawColor || "888888"}`,
       });
     }
   }
@@ -98,8 +108,8 @@ for (const zipName of FEEDS) {
   // trips.txt — only rows whose route we kept
   {
     const { header, rows } = await readCsv(join(dest, "trips.txt"));
-    const iRoute = header.indexOf("route_id");
-    const iShape = header.indexOf("shape_id");
+    const iRoute = requiredIdx(header, "route_id", feed, "trips.txt");
+    const iShape = requiredIdx(header, "shape_id", feed, "trips.txt");
     for (const r of rows) {
       const routeKey = `${feed}:${r[iRoute]}`;
       if (!routes.has(routeKey)) continue;
@@ -113,10 +123,10 @@ for (const zipName of FEEDS) {
   // shapes.txt — only shapes we need
   {
     const { header, rows } = await readCsv(join(dest, "shapes.txt"));
-    const iId = header.indexOf("shape_id");
-    const iLat = header.indexOf("shape_pt_lat");
-    const iLon = header.indexOf("shape_pt_lon");
-    const iSeq = header.indexOf("shape_pt_sequence");
+    const iId = requiredIdx(header, "shape_id", feed, "shapes.txt");
+    const iLat = requiredIdx(header, "shape_pt_lat", feed, "shapes.txt");
+    const iLon = requiredIdx(header, "shape_pt_lon", feed, "shapes.txt");
+    const iSeq = requiredIdx(header, "shape_pt_sequence", feed, "shapes.txt");
     for (const r of rows) {
       const shapeKey = `${feed}:${r[iId]}`;
       if (!shapeToRoute.has(shapeKey)) continue;

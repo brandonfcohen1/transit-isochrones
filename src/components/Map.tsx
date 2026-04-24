@@ -136,6 +136,20 @@ export default function Map() {
   // clicks a different origin, cancel the previous slow request so
   // stale data never overwrites the new query.
   const polygonAbortRef = useRef<AbortController | null>(null);
+  // AbortController for the stops fetch + the plan fetch, for the same
+  // stale-write reason. Stops is fast enough that overlap is rare, but
+  // not impossible at cold-start or under slow networks.
+  const stopsAbortRef = useRef<AbortController | null>(null);
+  const planAbortRef = useRef<AbortController | null>(null);
+  // Monotonic generation counter — bumped on every new runQuery. Guards
+  // against stale fetches that already passed abort (e.g. one finished
+  // JSON-parsing just as a new click aborted it) from overwriting the
+  // map state for the current query.
+  const runGenRef = useRef(0);
+  // Track the origin we last fitBounds'd to. On a re-run at the same
+  // origin we leave the viewport alone so the user can zoom in without
+  // being yanked out on every slider tick.
+  const lastFitOriginRef = useRef<{ lat: number; lng: number } | null>(null);
   const [stopCount, setStopCount] = useState<number | null>(null);
   const [modeCounts, setModeCounts] = useState<Record<StopMode, number> | null>(null);
   const [route, setRoute] = useState<RouteInfo | null>(null);
@@ -273,12 +287,15 @@ export default function Map() {
 
     // The origin moved — any previously rendered route is now stale.
     clearRoute();
-    // Cancel any in-flight polygon fetch; its stops have also been
-    // superseded by the new origin's stops. The stops-only fetch below
-    // isn't cancelable in the same way (it's so fast it's usually done
-    // before the user can click again) — if one does overtake, the
-    // completion guard via paramKey comparison drops stale writes.
+    // Cancel every in-flight fetch from the previous query. Each one
+    // races to update the map; without aborts the later click can see
+    // an earlier click's results land on top. The generation counter
+    // below is a second layer of protection in case a fetch had
+    // already resolved its body before the abort fired.
     polygonAbortRef.current?.abort();
+    stopsAbortRef.current?.abort();
+    planAbortRef.current?.abort();
+    const myGen = ++runGenRef.current;
 
     setLoading(true);
     setStopsReady(false);
@@ -310,10 +327,15 @@ export default function Map() {
     // user sees reach coverage while the polygon computes.
     const stopsParams = new URLSearchParams(baseParams);
     stopsParams.set("stopsOnly", "true");
+    const stopsController = new AbortController();
+    stopsAbortRef.current = stopsController;
     setErrorMsg(null);
     try {
-      const res = await fetch(`/api/isochrone?${stopsParams}`);
+      const res = await fetch(`/api/isochrone?${stopsParams}`, { signal: stopsController.signal });
       const data = (await res.json()) as StopsOnlyResponse | ApiError;
+      // If a newer runQuery has started, drop this result silently —
+      // the newer call owns the loading spinner and map state.
+      if (myGen !== runGenRef.current) return;
       if (!res.ok || "error" in data) {
         console.error("stops fetch error", data);
         setErrorMsg(
@@ -349,10 +371,13 @@ export default function Map() {
       }
     } catch (e) {
       if ((e as { name?: string }).name === "AbortError") return;
+      if (myGen !== runGenRef.current) return;
       console.error("stops fetch exception", e);
       setErrorMsg("Network error — is the dev server running?");
       setLoading(false);
       return;
+    } finally {
+      if (stopsAbortRef.current === stopsController) stopsAbortRef.current = null;
     }
 
     // Stage 2 — polygon. Cold ~2-5s. The oneToAll call from stage 1
@@ -370,6 +395,7 @@ export default function Map() {
     try {
       const res = await fetch(`/api/isochrone?${polygonParams}`, { signal: controller.signal });
       const data = (await res.json()) as PolygonOnlyResponse | ApiError;
+      if (myGen !== runGenRef.current) return;
       if (!res.ok || "error" in data) {
         console.error("polygon fetch error", data);
         setErrorMsg(
@@ -380,35 +406,41 @@ export default function Map() {
         return;
       }
       const isoSrc = map.getSource("iso") as maplibregl.GeoJSONSource | undefined;
-      // `data.polygon` is now a FeatureCollection of band features
-      // (1=innermost, N=outermost). Set it directly — the fill layer
-      // uses a data-driven opacity keyed on band.
+      // Server returns a single-feature FeatureCollection (one polygon
+      // per query; earlier multi-band rendering was reverted in round
+      // 9 because nested fills produced visual artifacts).
       isoSrc?.setData(data.polygon ?? { type: "FeatureCollection", features: [] });
-      // Autofit: pan/zoom so the whole polygon is visible. Without this
-      // the map stays at the user's current zoom, which often leaves a
-      // 60-min polygon looking "tiny" because only the downtown piece
-      // fits the viewport. maxZoom caps how close we go on a tiny
-      // walkshed (single 5-min origin); padding leaves room for the
-      // UI panels sitting over the corners.
+      // Autofit on first paint for this origin only. Re-runs at the
+      // same origin (slider tick, mode toggle) leave the viewport
+      // alone so in-zoom exploration isn't yanked back on every tick.
+      // Side padding is clamped so the fit still works on narrow
+      // viewports where fixed 320px side panels don't exist anyway.
       if (data.polygon && data.polygon.features.length > 0) {
-        const bounds = new maplibregl.LngLatBounds();
-        const extend = (coords: unknown): void => {
-          if (Array.isArray(coords) && coords.length > 0 && typeof coords[0] === "number") {
-            bounds.extend(coords as [number, number]);
-            return;
+        const prev = lastFitOriginRef.current;
+        const originChanged = !prev || Math.abs(prev.lat - lat) > 1e-5 || Math.abs(prev.lng - lng) > 1e-5;
+        if (originChanged) {
+          const bounds = new maplibregl.LngLatBounds();
+          const extend = (coords: unknown): void => {
+            if (Array.isArray(coords) && coords.length > 0 && typeof coords[0] === "number") {
+              bounds.extend(coords as [number, number]);
+              return;
+            }
+            if (Array.isArray(coords)) for (const c of coords) extend(c);
+          };
+          const outer = data.polygon.features[data.polygon.features.length - 1];
+          extend((outer.geometry as { coordinates: unknown }).coordinates);
+          if (!bounds.isEmpty()) {
+            const w = map.getCanvas().clientWidth || 800;
+            const sidePad = Math.min(320, Math.floor(w * 0.2));
+            map.fitBounds(bounds, { padding: { top: 80, right: sidePad, bottom: 80, left: sidePad }, maxZoom: 13, duration: 600 });
+            lastFitOriginRef.current = { lat, lng };
           }
-          if (Array.isArray(coords)) for (const c of coords) extend(c);
-        };
-        // Use only the OUTER band (largest) for the fit bounds.
-        const outer = data.polygon.features[data.polygon.features.length - 1];
-        extend((outer.geometry as { coordinates: unknown }).coordinates);
-        if (!bounds.isEmpty()) {
-          map.fitBounds(bounds, { padding: { top: 80, right: 320, bottom: 80, left: 320 }, maxZoom: 13, duration: 600 });
         }
       }
       setLastRanParamKey(paramKey);
     } catch (e) {
       if ((e as { name?: string }).name === "AbortError") return;
+      if (myGen !== runGenRef.current) return;
       console.error("polygon fetch exception", e);
       setErrorMsg("Network error while fetching polygon.");
     } finally {
@@ -498,21 +530,43 @@ export default function Map() {
       params.set("toLon", String(destination.lon));
     }
 
-    const res = await fetch(`/api/plan?${params}`);
-    const data = (await res.json()) as {
+    planAbortRef.current?.abort();
+    const planController = new AbortController();
+    planAbortRef.current = planController;
+    let res: Response;
+    let data: {
       itineraries: SlimItinerary[];
       direct: SlimItinerary[];
       destinationName?: string;
       error?: unknown;
     };
+    try {
+      res = await fetch(`/api/plan?${params}`, { signal: planController.signal });
+      data = await res.json();
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      console.error("plan exception", e);
+      setErrorMsg("Network error while fetching directions.");
+      return;
+    } finally {
+      if (planAbortRef.current === planController) planAbortRef.current = null;
+    }
     if (!res.ok || data.error) {
       console.error("plan error", data);
+      setErrorMsg(
+        res.status === 502
+          ? "Directions unavailable — routing service error."
+          : `Directions failed (HTTP ${res.status}).`,
+      );
       return;
     }
 
     // Pick the shortest-duration option across transit + direct.
     const pool = [...data.itineraries, ...data.direct];
-    if (pool.length === 0) return;
+    if (pool.length === 0) {
+      setErrorMsg("No route found to that destination.");
+      return;
+    }
     const itin = pool.reduce((a, b) => (a.duration < b.duration ? a : b));
     // Prefer server-reverse-geocoded name for free-coord destinations;
     // stop clicks already pass a real stop name.
