@@ -340,9 +340,18 @@ export async function GET(req: Request) {
       // :12/:23/:38/:47-style off-clock moments. The old plan()-per-
       // station probe was replaced by that sub-sample pass: same rail
       // coverage, ~50× faster (0.3s vs 14-18s).
+      // Anchors for the anchor-walk disk step in graphIsochrone.
+      // Include rail AND subway (SEPTA's M / NHSL is tagged SUBWAY in
+      // MOTIS; without it, NHSL stations in suburban PA rely only on
+      // the 18m-match intermodal pass and produce near-zero walksheds
+      // because suburban streets sit 40-80m from the grid). Dedup by
+      // id, keeping the lowest reach duration across the day.
       const railAnchors: Array<{ lat: number; lon: number; reachedAtMinutes: number; name: string; stopId: string }> = [];
+      const seenAnchors = new Set<string>();
       for (const s of stops) {
-        if (s.m !== "rail") continue;
+        if (s.m !== "rail" && s.m !== "subway") continue;
+        if (seenAnchors.has(s.id)) continue;
+        seenAnchors.add(s.id);
         railAnchors.push({ lat: s.lat, lon: s.lon, reachedAtMinutes: s.d, name: s.n ?? s.id, stopId: s.id });
       }
 

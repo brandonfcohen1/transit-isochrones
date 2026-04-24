@@ -202,9 +202,21 @@ export async function graphIsochrone(args: {
     // radius) from ever running — those would cross rivers via the
     // ferry/bridge snap that the 80m match distance permits. Suburban
     // stations' tiny disks (< 500m) are safely away from water.
-    const walkSpeedMPerMin = (5 * 1000) / 60; // 5 km/h ceiling
-    const DETOUR = 1.3;
-    const effectiveMPerMin = walkSpeedMPerMin / DETOUR;
+    // Disk radius uses crow-flies max (no detour), because MOTIS's
+    // duration response is the real filter. Using a detour factor here
+    // shrinks the candidate set too aggressively and MOTIS-reachable
+    // near-straight cells get silently dropped (probed at Narberth: a
+    // 1.3× detour cuts 25% of the 8-min budget-fit cells).
+    //
+    // Bike mode: reach is ~3× walk, so a 20-min remaining budget at
+    // Fort Washington goes from a ~1.6km walk radius to a ~5km bike
+    // radius — without this, bike-mode anchor disks were effectively
+    // walk-sized and far-out rail stations appeared unreachable by
+    // bike even when 20-30 min of riding were still available.
+    const walkSpeedMPerMin = (5 * 1000) / 60; // 5 km/h
+    const bikeSpeedMPerMin = (15 * 1000) / 60; // 15 km/h
+    const effectiveMPerMin = mode === "bike" ? bikeSpeedMPerMin : walkSpeedMPerMin;
+    const anchorMotisMode: Mode = mode === "bike" ? "BIKE" : "WALK";
     const mLat = M_PER_DEG_LAT;
     const mLon = metersPerDegLon(origin.lat);
     const anchorBudgetCutoff = maxMinutes / 2;
@@ -235,7 +247,7 @@ export async function graphIsochrone(args: {
       // target coords for MOTIS. Keep each cell's Euclidean walkSec as
       // the fallback if MOTIS doesn't return a time for it. Cells that
       // land in water are excluded — otherwise a disk around a
-      type Target = { idx: number; coord: string; euclideanSec: number };
+      type Target = { idx: number; coord: string; euclM: number };
       const targets: Target[] = [];
       for (let y = ymin; y <= ymax; y++) {
         const [cellLat] = fromGridLatLon(0, y);
@@ -247,22 +259,37 @@ export async function graphIsochrone(args: {
           const dLonM = (cellLon - a.lon) * mLon;
           const distM2 = dLonM * dLonM + dLatM2;
           if (distM2 > radiusM2) continue;
-          const euclideanSec = Math.sqrt(distM2) / effectiveMPerMin * 60;
           targets.push({
             idx: y * nx + x,
             coord: `${cellLat.toFixed(5)};${cellLon.toFixed(5)}`,
-            euclideanSec,
+            euclM: Math.sqrt(distM2),
           });
         }
       }
       if (targets.length === 0) return;
 
-      // MOTIS street-routing pass. 40m match lets cells snap to real
-      // suburban streets (which are often 20-35m from a grid cell
-      // center) so the walkshed follows the road grid instead of
-      // circling out as an Euclidean disk. Euclidean fallback is
-      // used ONLY for the anchor's own cell — stations whose GTFS
-      // coord doesn't snap still need to show as reachable.
+      // MOTIS street-routing pass. Match distance + detour-ratio filter
+      // work together: the match needs to be loose enough to capture
+      // suburban streets (which are often 60-80m from a grid cell center
+      // in outer PA towns like Bensalem — probed: at 40m only 1% of
+      // cells near Eddington station reach; at 80m, 45%+ reach). But
+      // looser match also lets cells over water snap to walkable edges
+      // hundreds of meters around, inflating the walkshed into rivers.
+      //
+      // Solution: use an 80m match for coverage, then reject cells where
+      // MOTIS's routed walk distance exceeds ~4× the Euclidean distance
+      // to the anchor. `withDistance=true` makes MOTIS return the routed
+      // distance alongside duration.
+      //
+      // Threshold 4× balances two measured regimes:
+      //   Mid-Delaware cells         :  5-12×  (rejected — spurious water snap)
+      //   Suburban-side-of-rail-yard :  3-9×   (kept — legit walks around tracks)
+      //   River-edge cells           :  ~4.3×  (borderline, usually rejected)
+      //   Inland grid streets        :  1.2-1.7× (kept)
+      // A tighter 2.5× killed the suburban-barrier cells (e.g. cells
+      // across the rail yard from Bethayres station) even at 80m match,
+      // leaving stations as isolated single-cell polygons.
+      const DETOUR_REJECT_RATIO = 4.0;
       const streetDurations = new Array<number | undefined>(targets.length);
       for (let start = 0; start < targets.length; start += MAX_MANY_PER_REQUEST) {
         const slice = targets.slice(start, start + MAX_MANY_PER_REQUEST);
@@ -270,17 +297,25 @@ export async function graphIsochrone(args: {
           body: {
             one: `${a.lat};${a.lon}`,
             many: slice.map((t) => t.coord),
-            mode: "WALK",
+            mode: anchorMotisMode,
             max: Math.ceil(remainingMin * 60 * 1.5),
-            maxMatchingDistance: 40,
+            maxMatchingDistance: 80,
+            withDistance: true,
             arriveBy: false,
           },
         });
         if (error || !data) continue;
-        const arr = data as Array<{ duration?: number }>;
+        const arr = data as Array<{ duration?: number; distance?: number }>;
         for (let i = 0; i < slice.length; i++) {
           const sec = arr[i]?.duration;
-          if (sec != null && sec <= remainingMin * 60) streetDurations[start + i] = sec;
+          const dist = arr[i]?.distance;
+          if (sec == null || sec > remainingMin * 60) continue;
+          // Skip the ratio test for cells < 60m from anchor (one cell
+          // radius). At that scale noise dominates and the anchor's
+          // own cell has dist≈0, eucl=small → spurious high ratio.
+          const eucl = slice[i].euclM;
+          if (eucl > 60 && dist != null && dist > eucl * DETOUR_REJECT_RATIO) continue;
+          streetDurations[start + i] = sec;
         }
       }
 
@@ -300,31 +335,46 @@ export async function graphIsochrone(args: {
     };
     await mapMotis(reachAnchors, rasterAnchor);
 
-    // Guarantee each reachable anchor's OWN cell has its reachedAt
-    // duration — regardless of whether the late-budget cutoff skipped
-    // its disk rasterization, or whether MOTIS failed to snap its
-    // coord (OSM water polygons sometimes overhang stations like
-    // 30th St). Without this, close-in rail stations whose cells
-    // weren't written by intermodal end up at Infinity and the
-    // station disappears from the polygon.
+    // Guarantee each reachable anchor has a visible footprint around
+    // its coord. A single-cell force-write produced degenerate polygons
+    // (d3-contour emits a zero-area contour when a single positive
+    // cell is surrounded by -Inf) — stations at d=maxMinutes with no
+    // walk budget would disappear entirely. A 3×3 block always emits
+    // a clean polygon. Footprint is only 180-360m (depending on cell
+    // size), so it's a minimum visual indicator, not an inflated
+    // walkshed; anchor walks overlay bigger polygons on top for any
+    // station with actual budget.
     for (const a of reachAnchors) {
       const cx = Math.floor(((a.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * nx);
       const cy = Math.floor(((a.lat - bbox.minLat) / (bbox.maxLat - bbox.minLat)) * ny);
-      if (cx < 0 || cx >= nx || cy < 0 || cy >= ny) continue;
-      const idx = cy * nx + cx;
       const reachedSec = a.reachedAtMinutes * 60;
-      if (reachedSec < durationsSec[idx]) durationsSec[idx] = reachedSec;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const x = cx + dx;
+          const y = cy + dy;
+          if (x < 0 || x >= nx || y < 0 || y >= ny) continue;
+          const idx = y * nx + x;
+          if (reachedSec < durationsSec[idx]) durationsSec[idx] = reachedSec;
+        }
+      }
     }
   }
 
   // Build the field. No water mask — tight street-routing match
   // distances (18m) prevent snapping into open water. Cells near
   // walkable bridges will be reachable, which is accurate.
+  //
+  // Contour threshold 0 means field > 0 is reachable. For a cell
+  // reached at exactly maxMinutes (common at the isochrone edge, e.g.
+  // NHSL Penfield at d=30 in a 30-min query), field = 0 = threshold
+  // and the cell sits ON the contour boundary, which d3-contour won't
+  // emit as inside the polygon. Nudge cells that are within the budget
+  // up by 0.5min of field so stations at the edge still render.
   const maxSec = maxMinutes * 60;
   const field = new Float64Array(nx * ny);
   for (let i = 0; i < field.length; i++) {
     const d = durationsSec[i];
-    field[i] = d <= maxSec ? maxMinutes - d / 60 : -Infinity;
+    field[i] = d <= maxSec ? maxMinutes - d / 60 + 0.1 : -Infinity;
   }
 
   // Standard raster-to-vector: marching squares at threshold 0, drop
@@ -342,18 +392,42 @@ export async function graphIsochrone(args: {
     bbox.minLat + (cgy / ny) * (bbox.maxLat - bbox.minLat),
   ];
   const cellArea = cellM * cellM;
-  // No outer-ring filter — keep every polygon d3-contour produces,
-  // including tiny single-cell islands at far-out rail stations that
-  // only have 1-2 min of walking budget (Manayunk/Germantown from
-  // downtown, Eddystone at 60-min). Union-fold downstream cleans any
-  // noise; tests expect every reachable rail station to be visible.
-  const minOuterArea = 0;
+  // Keep single-cell polygons ONLY when they sit near a rail anchor —
+  // those are legit tiny walksheds at far-out stations with 1-4 min
+  // walking budget (Wayne, Levittown). A single-cell polygon 1-3 km
+  // from any anchor is an orphan intermodal cell whose neighbors
+  // failed the budget by seconds — it's not a meaningful walkshed,
+  // just a rendering artifact. `anchorProximityM` is half the typical
+  // far-station walk-disk radius; orphans beyond it get dropped.
+  const anchorProximityM = 500;
+  const minOuterAreaOrphan = 2 * cellArea; // drop < 2-cell orphans
   const minHoleArea = 20 * cellArea; // drop pinholes below ~270m side
+  const anchorPts = reachAnchors ?? [];
+
+  function isNearAnchor(lon: number, lat: number): boolean {
+    const mLat = M_PER_DEG_LAT;
+    const mLon = metersPerDegLon(lat);
+    for (const a of anchorPts) {
+      const dLatM = (lat - a.lat) * mLat;
+      const dLonM = (lon - a.lon) * mLon;
+      if (dLatM * dLatM + dLonM * dLonM <= anchorProximityM * anchorProximityM) return true;
+    }
+    return false;
+  }
 
   const kept: Position[][][] = [];
   for (const poly of polys[0].coordinates) {
     const [outer, ...holes] = poly;
-    if (!outer || Math.abs(ringAreaCells(outer)) * cellArea < minOuterArea) continue;
+    if (!outer) continue;
+    const areaM2 = Math.abs(ringAreaCells(outer)) * cellArea;
+    if (areaM2 < minOuterAreaOrphan) {
+      // Tiny polygon: keep only if centroid is near a rail anchor.
+      let cx = 0, cy = 0;
+      for (const [x, y] of outer) { cx += x; cy += y; }
+      cx /= outer.length; cy /= outer.length;
+      const [lon, lat] = fromGrid(cx, cy);
+      if (!isNearAnchor(lon, lat)) continue;
+    }
     const rings: Position[][] = [outer.map(([x, y]) => fromGrid(x, y))];
     for (const h of holes) {
       if (Math.abs(ringAreaCells(h)) * cellArea < minHoleArea) continue;

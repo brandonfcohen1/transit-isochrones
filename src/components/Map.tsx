@@ -73,6 +73,12 @@ function bestCaseSampleTimes(departureLocal: string): string[] {
 type RouteInfo = {
   destination: { name: string; lat: number; lon: number };
   itinerary: SlimItinerary;
+  // Best-case duration (minutes) from the isochrone's `d` field when the
+  // destination is a reachable stop. Non-null means "isochrone said this
+  // was reachable in X min best-case." If the plan() at the user's
+  // selected departure is longer, show both so the schedule gap is
+  // visible instead of seeming like a bug.
+  bestCaseMin?: number;
 };
 
 // SEPTA nomenclature: GTFS/MOTIS emit "TRAM" for the 10/11/13/15/34/36
@@ -163,8 +169,9 @@ export default function Map() {
   // debug knob ("is Regional Rail actually reaching X?") and as a user
   // feature ("bus-only commute").
   const [busEnabled, setBusEnabled] = useState(true);
-  const [subwayEnabled, setSubwayEnabled] = useState(true);
-  const [trolleyEnabled, setTrolleyEnabled] = useState(true);
+  // "Metro" is the SEPTA 2024 branding for MFL + BSL + Trolleys. One
+  // toggle flips both subway and trolley on the server side.
+  const [metroEnabled, setMetroEnabled] = useState(true);
   const [railEnabled, setRailEnabled] = useState(true);
 
   useEffect(() => {
@@ -173,11 +180,13 @@ export default function Map() {
 
   // URL-hash state sync. Hash format:
   //   #LAT,LON/MIN/MODE/BEST/MODES
-  // e.g. #39.9526,-75.1635/30/walk/1/BSR  (bus+subway+rail, no trolley, best-case on)
+  // e.g. #39.9526,-75.1635/30/walk/1/BMR  (bus+metro+rail, best-case on)
   // Missing segments = keep defaults. Restored once on mount + written
   // whenever state changes, so refresh/share preserves the view. If the
   // hash includes an origin, auto-run once the `departure` default is
-  // in place so the user lands on a restored polygon.
+  // in place so the user lands on a restored polygon. Legacy S/T flags
+  // (separate subway + trolley) are still accepted — either one turns
+  // Metro on — so old shared links keep working.
   const hashReadRef = useRef(false);
   const pendingRestoreRef = useRef<{ lat: number; lng: number } | null>(null);
   useEffect(() => {
@@ -201,8 +210,9 @@ export default function Map() {
     if (best === "1") setBestCase(true);
     if (modeFlags != null) {
       setBusEnabled(modeFlags.includes("B"));
-      setSubwayEnabled(modeFlags.includes("S"));
-      setTrolleyEnabled(modeFlags.includes("T"));
+      setMetroEnabled(
+        modeFlags.includes("M") || modeFlags.includes("S") || modeFlags.includes("T"),
+      );
       setRailEnabled(modeFlags.includes("R"));
     }
   }, []);
@@ -211,17 +221,17 @@ export default function Map() {
   // don't stuff the back-button history with every slider tick.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const flags = `${busEnabled ? "B" : ""}${subwayEnabled ? "S" : ""}${trolleyEnabled ? "T" : ""}${railEnabled ? "R" : ""}`;
+    const flags = `${busEnabled ? "B" : ""}${metroEnabled ? "M" : ""}${railEnabled ? "R" : ""}`;
     const origin = clickRef.current ? `${clickRef.current.lat.toFixed(4)},${clickRef.current.lng.toFixed(4)}` : "";
     const hash = origin ? `#${origin}/${minutes}/${streetMode}/${bestCase ? 1 : 0}/${flags}` : "";
     if (window.location.hash !== hash) {
       window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
     }
-  }, [minutes, streetMode, bestCase, busEnabled, subwayEnabled, trolleyEnabled, railEnabled, lastRanParamKey]);
+  }, [minutes, streetMode, bestCase, busEnabled, metroEnabled, railEnabled, lastRanParamKey]);
 
   // Always-current snapshot of the query params for the click handler.
-  const queryRef = useRef({ departure, bestCase, minutes, streetMode, busEnabled, subwayEnabled, trolleyEnabled, railEnabled });
-  queryRef.current = { departure, bestCase, minutes, streetMode, busEnabled, subwayEnabled, trolleyEnabled, railEnabled };
+  const queryRef = useRef({ departure, bestCase, minutes, streetMode, busEnabled, metroEnabled, railEnabled });
+  queryRef.current = { departure, bestCase, minutes, streetMode, busEnabled, metroEnabled, railEnabled };
 
   const clearRoute = useCallback(() => {
     const map = mapRef.current;
@@ -273,13 +283,13 @@ export default function Map() {
     setLoading(true);
     setStopsReady(false);
     setStopCount(null);
-    const { departure, bestCase, minutes, streetMode, busEnabled, subwayEnabled, trolleyEnabled, railEnabled } = queryRef.current;
+    const { departure, bestCase, minutes, streetMode, busEnabled, metroEnabled, railEnabled } = queryRef.current;
     if (!departure) { setLoading(false); return; }
     const time = new Date(departure).toISOString();
     const enabledModes: string[] = [];
     if (busEnabled) enabledModes.push("BUS");
-    if (subwayEnabled) enabledModes.push("SUBWAY");
-    if (trolleyEnabled) enabledModes.push("TRAM");
+    // "Metro" groups subway (MFL + BSL) and trolley under one toggle.
+    if (metroEnabled) { enabledModes.push("SUBWAY"); enabledModes.push("TRAM"); }
     if (railEnabled) enabledModes.push("REGIONAL_RAIL");
     const allOn = enabledModes.length === 4;
     const modesKey = allOn ? "T" : [...enabledModes].sort().join("+");
@@ -432,8 +442,7 @@ export default function Map() {
   // queries are 60s and we don't want to fire one per slider tick).
   const currentEnabledModes: string[] = [];
   if (busEnabled) currentEnabledModes.push("BUS");
-  if (subwayEnabled) currentEnabledModes.push("SUBWAY");
-  if (trolleyEnabled) currentEnabledModes.push("TRAM");
+  if (metroEnabled) { currentEnabledModes.push("SUBWAY"); currentEnabledModes.push("TRAM"); }
   if (railEnabled) currentEnabledModes.push("REGIONAL_RAIL");
   const currentModesKey = currentEnabledModes.length === 4 ? "T" : [...currentEnabledModes].sort().join("+");
   const currentParamKey = clickRef.current
@@ -468,7 +477,7 @@ export default function Map() {
   // Fetch the fastest itinerary from origin → destination and paint its
   // legs on the map. `destination` can be a reachable-stop feature (with
   // a stopId we pass to MOTIS) or a free-lat/lon pin.
-  const showRouteTo = useCallback(async (destination: { lat: number; lon: number; name: string; stopId?: string }) => {
+  const showRouteTo = useCallback(async (destination: { lat: number; lon: number; name: string; stopId?: string; bestCaseMin?: number }) => {
     const map = mapRef.current;
     if (!map) return;
     const origin = clickRef.current;
@@ -532,7 +541,11 @@ export default function Map() {
       .setPopup(new maplibregl.Popup({ offset: 18 }).setText(resolvedName))
       .addTo(map);
 
-    setRoute({ destination: { name: resolvedName, lat: destination.lat, lon: destination.lon }, itinerary: itin });
+    setRoute({
+      destination: { name: resolvedName, lat: destination.lat, lon: destination.lon },
+      itinerary: itin,
+      bestCaseMin: destination.bestCaseMin,
+    });
   }, []);
 
   useEffect(() => {
@@ -720,7 +733,8 @@ export default function Map() {
       const [lon, lat] = geom.coordinates;
       const stopId = f.properties?.id as string | undefined;
       const stopName = (f.properties?.name as string | undefined) ?? stopId ?? "stop";
-      showRouteTo({ lat, lon, name: stopName, stopId });
+      const bestCaseMin = typeof f.properties?.duration === "number" ? f.properties.duration : undefined;
+      showRouteTo({ lat, lon, name: stopName, stopId, bestCaseMin });
       e.preventDefault();
     };
     for (const layerId of ["stops-bus", "stops-trolley", "stops-subway", "stops-rail"]) {
@@ -836,9 +850,8 @@ export default function Map() {
           <span className="text-neutral-500">Transit</span>
           <div className="flex flex-wrap gap-x-3 gap-y-1">
             <ModeCheckbox color="#9ca3af" label="Bus" checked={busEnabled} onChange={setBusEnabled} />
-            <ModeCheckbox color="#f97316" label="Subway" checked={subwayEnabled} onChange={setSubwayEnabled} />
-            <ModeCheckbox color="#10b981" label="Trolley" checked={trolleyEnabled} onChange={setTrolleyEnabled} />
-            <ModeCheckbox color="#7c3aed" label="Rail" checked={railEnabled} onChange={setRailEnabled} />
+            <ModeCheckbox color="#f97316" label="Metro" checked={metroEnabled} onChange={setMetroEnabled} />
+            <ModeCheckbox color="#7c3aed" label="Regional Rail" checked={railEnabled} onChange={setRailEnabled} />
           </div>
         </div>
         <div className="text-[11px] text-neutral-500 dark:text-neutral-400">
@@ -915,9 +928,8 @@ export default function Map() {
           </div>
           {!loading && modeCounts && (
             <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-neutral-600 dark:text-neutral-300">
-              <ModeSwatch color="#7c3aed" label="rail" n={modeCounts.rail} />
-              <ModeSwatch color="#f97316" label="subway" n={modeCounts.subway} />
-              <ModeSwatch color="#10b981" label="trolley" n={modeCounts.trolley} />
+              <ModeSwatch color="#7c3aed" label="regional rail" n={modeCounts.rail} />
+              <ModeSwatch color="#f97316" label="metro" n={modeCounts.subway + modeCounts.trolley} />
               <ModeSwatch color="#9ca3af" label="bus" n={modeCounts.bus + modeCounts.other} />
             </div>
           )}
@@ -931,6 +943,12 @@ export default function Map() {
               <div className="text-[11px] text-neutral-500">
                 {Math.round(route.itinerary.duration / 60)} min · {route.itinerary.transfers} transfer{route.itinerary.transfers === 1 ? "" : "s"}
               </div>
+              {route.bestCaseMin != null && Math.round(route.itinerary.duration / 60) > route.bestCaseMin && (
+                <div className="mt-0.5 text-[11px] text-neutral-500">
+                  <span className="text-emerald-600 dark:text-emerald-400">{route.bestCaseMin} min best-case</span>
+                  <span className="ml-1 text-neutral-400">with a better-timed departure</span>
+                </div>
+              )}
             </div>
             <button
               type="button"
