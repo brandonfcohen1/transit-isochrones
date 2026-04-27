@@ -163,7 +163,13 @@ export async function graphIsochrone(args: {
           maxDirectTime: Math.min(maxMinutes, mode === "bike" ? maxMinutes : 45) * 60,
         },
       });
-      if (error) return;
+      if (error) {
+        // MOTIS rejects oversized batches (`onetomany_max_many` cap); log
+        // loudly so the operator sees the cap mismatch instead of silently
+        // returning a sparse polygon.
+        console.error(`[graphIsochrone] one-to-many-intermodal batch failed: ${JSON.stringify(error).slice(0, 300)}`);
+        return;
+      }
       const j = data as OneToManyIntermodalResponse;
       const street = j.street_durations ?? [];
       const transit = j.transit_durations ?? [];
@@ -399,7 +405,7 @@ export async function graphIsochrone(args: {
   // bridging legitimate barriers (rail yards, river edges) which
   // we don't want — water clip can't catch those because the
   // bridged cells sit on actual land. 2 is the empirical sweet spot.
-  const CLOSE_PASSES = 5;
+  const CLOSE_PASSES = 2;
   const reachable = new Uint8Array(nx * ny);
   for (let i = 0; i < field.length; i++) reachable[i] = field[i] > 0 ? 1 : 0;
 
