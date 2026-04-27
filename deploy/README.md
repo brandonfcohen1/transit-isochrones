@@ -68,7 +68,7 @@ Hetzner Cloud console → **Add Server**:
 - **Image**: Ubuntu 24.04
 - **Type**: **CPX11** ($4.13/mo, 2 vCPU AMD, 2 GB RAM, 40 GB SSD). CX22 ($4.51) also works if you want extra headroom.
 - **Networking**: leave IPv4 + IPv6 enabled
-- **Cloud config**: paste the contents of `deploy/cloud-init.yml`. **Edit the `ssh_authorized_keys` line first** to put your real public key there.
+- **Cloud config**: copy `deploy/cloud-init.yml.example` to `deploy/cloud-init.yml` (gitignored), edit the `ssh_authorized_keys` line to your real public key (`cat ~/.ssh/id_ed25519.pub`), then paste the contents into Hetzner's User Data field.
 - **Name**: `septa-iso`
 - Click **Create**
 

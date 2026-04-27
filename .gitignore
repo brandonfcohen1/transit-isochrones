@@ -37,6 +37,11 @@ yarn-error.log*
 .env*
 !deploy/.env.example
 
+# Deploy cloud-init has the operator's real SSH public key + email
+# embedded; keep that out of the public repo. cloud-init.yml.example is
+# the placeholder template — copy + edit + paste into Hetzner.
+/deploy/cloud-init.yml
+
 # vercel
 .vercel
 
