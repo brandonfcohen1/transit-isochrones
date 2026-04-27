@@ -45,7 +45,7 @@ sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' \
 
 # Pack into a tarball:
 bun run pack:motis
-ls -lh dist/motis-dataset.tar.gz   # ~145 MB
+ls -lh dist/motis-dataset.tar.gz   # ~120 MB after the tuning knobs in data/config.yml
 ```
 
 ### Upload the tarball to R2
@@ -91,8 +91,8 @@ ssh in (cloud-init has finished when this works without password):
 
 ```bash
 ssh deploy@<server-ip>
-git clone https://github.com/<you>/septa-iso
-cd septa-iso/deploy
+git clone https://github.com/brandonfcohen1/transit-isochrones
+cd transit-isochrones/deploy
 cp .env.example .env
 $EDITOR .env                  # paste the R2 URL into MOTIS_DATASET_URL
 $EDITOR Caddyfile             # replace example.com with your domain + email
@@ -101,7 +101,7 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 The first `up -d --build` takes ~5 min: Next.js builds (~3 min, peaks
 ~1.5 GB swap-assisted), the image is assembled, the container starts,
-the bootstrap fetches the 145 MB tarball from R2, MOTIS mmaps the graph.
+the bootstrap fetches the ~120 MB tarball from R2, MOTIS mmaps the graph.
 Caddy hits Let's Encrypt and gets a real cert in ~30 s once your DNS
 points at the server.
 
@@ -120,7 +120,7 @@ When `app` reports `MOTIS up` and `Ready`, hit `https://septa-iso.your-domain.co
 
 ```bash
 ssh deploy@<server-ip>
-cd septa-iso
+cd transit-isochrones
 git pull
 cd deploy
 docker compose -f docker-compose.prod.yml up -d --build
@@ -142,7 +142,7 @@ rclone copy dist/motis-dataset.tar.gz r2:septa-iso-data/
 On the server:
 ```bash
 ssh deploy@<server-ip>
-cd septa-iso/deploy
+cd transit-isochrones/deploy
 docker compose -f docker-compose.prod.yml down app
 docker volume rm deploy_workspace   # forces re-fetch
 docker compose -f docker-compose.prod.yml up -d app
