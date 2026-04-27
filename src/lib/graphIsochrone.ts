@@ -384,6 +384,76 @@ export async function graphIsochrone(args: {
     field[i] = d <= maxSec ? maxMinutes - d / 60 + 0.1 : -Infinity;
   }
 
+  // Binary morphological closing on the reachability mask. Fills
+  // mid-block holes (cells whose center is more than 18 m from any
+  // walkable OSM way — typically interior of large blocks, parking
+  // lots) without expanding the outer boundary. Standard image-
+  // processing technique: dilate N times, then erode N times. The
+  // dilate-erode pair is what makes this safer than naive dilation
+  // — naive dilation expanded the polygon outward by N cells in
+  // every direction, producing rectangular blobs around isolated
+  // rail-anchor seeds; closing contracts the boundary back, leaving
+  // shape integrity intact.
+  //
+  // N=2 fills holes up to ~2 cells wide (~120 m). Larger N starts
+  // bridging legitimate barriers (rail yards, river edges) which
+  // we don't want — water clip can't catch those because the
+  // bridged cells sit on actual land. 2 is the empirical sweet spot.
+  const CLOSE_PASSES = 2;
+  const reachable = new Uint8Array(nx * ny);
+  for (let i = 0; i < field.length; i++) reachable[i] = field[i] > 0 ? 1 : 0;
+
+  for (let pass = 0; pass < CLOSE_PASSES; pass++) {
+    const next = new Uint8Array(reachable);
+    for (let y = 1; y < ny - 1; y++) {
+      for (let x = 1; x < nx - 1; x++) {
+        const idx = y * nx + x;
+        if (reachable[idx]) continue;
+        outer: for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            if (reachable[(y + dy) * nx + (x + dx)]) {
+              next[idx] = 1;
+              break outer;
+            }
+          }
+        }
+      }
+    }
+    reachable.set(next);
+  }
+  for (let pass = 0; pass < CLOSE_PASSES; pass++) {
+    const next = new Uint8Array(reachable);
+    for (let y = 1; y < ny - 1; y++) {
+      for (let x = 1; x < nx - 1; x++) {
+        const idx = y * nx + x;
+        if (!reachable[idx]) continue;
+        outer: for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            if (!reachable[(y + dy) * nx + (x + dx)]) {
+              next[idx] = 0;
+              break outer;
+            }
+          }
+        }
+      }
+    }
+    reachable.set(next);
+  }
+
+  // Patch the field with the closed mask. Cells filled by the close
+  // pass get a small positive field value (small "minutes remaining"
+  // so they sit just inside the contour without distorting the time
+  // gradient elsewhere). Cells removed by the close pass go to -Inf.
+  for (let i = 0; i < field.length; i++) {
+    if (reachable[i] && field[i] <= 0) {
+      field[i] = 0.3;
+    } else if (!reachable[i] && field[i] > 0) {
+      field[i] = -Infinity;
+    }
+  }
+
   // Standard raster-to-vector: marching squares at threshold 0, drop
   // noise, project to lat/lon, simplify. Holes get a stricter filter
   // than outer rings — a cell that came back Infinity from MOTIS is
