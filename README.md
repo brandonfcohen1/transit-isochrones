@@ -28,26 +28,48 @@ curl -L -o data/pennsylvania-latest.osm.pbf https://download.geofabrik.de/north-
 
 ## Deploy: single container (production)
 
-Builds MOTIS + the Next.js app into one image running under supervisord. Good for a $5–8/mo VPS.
+Builds MOTIS + the Next.js app into one image running under supervisord. Two ways to provision the MOTIS dataset:
+
+### (a) Bind-mount, build the graph on the deploy box
+
+For boxes with ≥4 GB free RAM during import. The graph build takes 5–15 min and is a one-time cost.
 
 ```bash
-# 1. Build the image
 docker build -t septa-iso .
-
-# 2. One-time MOTIS graph build (uses the same image, runs MOTIS import
-#    then exits). Takes several minutes. Output ends up in ./data/data/.
 docker run --rm -v $(pwd)/data:/workspace -w /workspace septa-iso /motis import
-
-# 3. Run
 docker run -d --name septa-iso --restart unless-stopped \
-  -v $(pwd)/data:/workspace \
+  -v $(pwd)/data:/workspace -p 3000:3000 \
+  septa-iso
+```
+
+### (b) Pre-built dataset, fetched on boot
+
+Best for small VMs (Hetzner CX22 at $4/mo, etc.) that can't run `motis import` themselves — the import peaks at 4–8 GB RAM. The operator imports on a beefy machine once, packs the dataset into a tarball, uploads to object storage, and points the deploy at it.
+
+```bash
+# Locally (one-time, on a machine with ≥8 GB RAM):
+docker run --rm -v $(pwd)/data:/workspace -w /workspace septa-iso /motis import
+bun run pack:motis                                 # → dist/motis-dataset.tar.gz (~360 MB)
+rclone copy dist/motis-dataset.tar.gz r2:bucket/   # or aws s3 cp …
+
+# On the deploy box:
+docker run -d --name septa-iso --restart unless-stopped \
+  -v septa-data:/workspace \
+  -e MOTIS_DATASET_URL=https://your-bucket.r2.dev/motis-dataset.tar.gz \
   -p 3000:3000 \
   septa-iso
 ```
 
-Exposes `:3000` (Next.js). MOTIS runs inside the container on `127.0.0.1:8080` and isn't published. First request after cold boot waits ~30 s for MOTIS to load its graph; after that, normal latencies.
+The container's `motis-bootstrap.sh` fetches and extracts on first start (~60–90 s for 360 MB). A `.bootstrapped` marker on the volume prevents re-fetch on restarts. Re-import locally + re-upload + delete the marker (or wipe the volume) when you want to refresh GTFS.
 
-Docker healthcheck probes `/api/health` — platforms like Fly.io or Render will respect it.
+Either way, `:3000` exposes Next.js; MOTIS sits on `127.0.0.1:8080` inside the container. First request after cold boot waits ~30 s for MOTIS to load its graph. Docker healthcheck probes `/api/health`.
+
+For HTTPS on a VPS, front this with Caddy or Traefik. A two-line Caddyfile gets you Let's Encrypt automatically:
+```
+your-domain.com {
+  reverse_proxy localhost:3000
+}
+```
 
 ## Dev: multi-service compose
 
@@ -92,10 +114,9 @@ bun run test:coverage     # Golden-set rail-coverage regression test
 
 ## Deploy notes
 
-MOTIS won't fit on a $7 Render Starter (needs ~4 GB for SEPTA GTFS + PA OSM). Split the deploy:
-- **MOTIS**: Hetzner CX22 (~$5/mo, 4 GB, 2 vCPU) or Render Pro (~$85/mo). Set `MOTIS_URL` on the app to its private hostname.
-- **App**: Render Starter (512 MB) fits. LRU caches + transient per-request allocations sit around 150–200 MB peak.
-- **CDN**: `Cache-Control: public, max-age=60, s-maxage=300` on `/api/isochrone` lets a CDN (Cloudflare free tier works) absorb repeat hits.
+- **Single-box** (Hetzner CX22, $4/mo, 4 GB, 2 vCPU): use deploy path (b) above. The 4–8 GB RAM `motis import` peak doesn't run on the box; you ship a pre-built tarball. MOTIS server steady-state sits at ~1.5 GB resident, leaving ~2 GB for Next.js + OS.
+- **Two-box** (any tiny app host + a beefier MOTIS box): set `MOTIS_URL` on the app to MOTIS's private hostname. Lets a 512 MB app dyno on Render Starter front a separate MOTIS box.
+- **CDN**: `Cache-Control: public, max-age=60, s-maxage=300` on `/api/isochrone` lets a CDN (Cloudflare free tier) absorb repeat hits.
 
 ## Notable design decisions
 
