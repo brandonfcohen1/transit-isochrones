@@ -399,7 +399,7 @@ export async function graphIsochrone(args: {
   // bridging legitimate barriers (rail yards, river edges) which
   // we don't want — water clip can't catch those because the
   // bridged cells sit on actual land. 2 is the empirical sweet spot.
-  const CLOSE_PASSES = 2;
+  const CLOSE_PASSES = 3;
   const reachable = new Uint8Array(nx * ny);
   for (let i = 0; i < field.length; i++) reachable[i] = field[i] > 0 ? 1 : 0;
 
