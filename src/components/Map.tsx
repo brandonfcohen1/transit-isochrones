@@ -515,15 +515,27 @@ export default function Map() {
     const origin = clickRef.current;
     if (!origin) return;
 
-    const { departure, streetMode } = queryRef.current;
+    const { departure, streetMode, bestCase } = queryRef.current;
     if (!departure) return;
 
+    // Best-case directions: search the full operating day (5am–11pm
+    // local) so the chosen itinerary matches the polygon, which is also
+    // a best-across-the-day reach. Without this, the plan locks to one
+    // departure near `time` and disagrees with the polygon — e.g. picks
+    // a longer walk because the closer station's next train just left.
+    const datePart = departure.split("T")[0];
+    const planTimeISO = bestCase && datePart
+      ? new Date(`${datePart}T${String(BEST_CASE_START_HOUR).padStart(2, "0")}:00`).toISOString()
+      : new Date(departure).toISOString();
     const params = new URLSearchParams({
       fromLat: String(origin.lat),
       fromLon: String(origin.lng),
-      time: new Date(departure).toISOString(),
+      time: planTimeISO,
       mode: streetMode,
     });
+    if (bestCase) {
+      params.set("searchWindow", String((BEST_CASE_END_HOUR - BEST_CASE_START_HOUR) * 3600));
+    }
     if (destination.stopId) params.set("toStop", destination.stopId);
     else {
       params.set("toLat", String(destination.lat));

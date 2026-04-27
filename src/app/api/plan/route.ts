@@ -26,7 +26,74 @@ type SlimItinerary = {
   legs: SlimLeg[];
 };
 
+// MOTIS sometimes returns a transit leg's polyline as the *whole train's* route
+// shape with the boarding-stop coord prepended at index 0 — so a Suburban→Eastwick
+// leg on a Warminster-through-Airport train arrives with a 3 km Suburban→Temple
+// jump glued on the front, then the train's actual path. Drawn raw, that's the
+// "diagonal that's not a track" — it ghost-routes you to Temple and back before
+// the real journey starts.
+//
+// Trim: find the last occurrence of leg.from in the polyline (within 300 m and
+// with a continuous neighbor) before the closest match for leg.to, and slice.
+// Walk/bike legs are routed point-to-point and don't need trimming.
+function trimLegGeometry(
+  coords: [number, number][],
+  from: { lat: number; lon: number },
+  to: { lat: number; lon: number },
+): [number, number][] {
+  if (coords.length < 2) return coords;
+  const sqMeters = (i: number, lat: number, lon: number) => {
+    const dx = (coords[i][0] - lon) * 85_000;
+    const dy = (coords[i][1] - lat) * 111_000;
+    return dx * dx + dy * dy;
+  };
+
+  let toIdx = 0;
+  let toBest = Infinity;
+  for (let i = 0; i < coords.length; i++) {
+    const d = sqMeters(i, to.lat, to.lon);
+    if (d < toBest) {
+      toBest = d;
+      toIdx = i;
+    }
+  }
+  if (toIdx === 0) return coords;
+
+  const TOL_M2 = 300 * 300;
+  const ADJ_M2 = 500 * 500;
+  let fromIdx = -1;
+  for (let i = toIdx - 1; i >= 0; i--) {
+    if (sqMeters(i, from.lat, from.lon) > TOL_M2) continue;
+    if (i + 1 < coords.length) {
+      const dx = (coords[i + 1][0] - coords[i][0]) * 85_000;
+      const dy = (coords[i + 1][1] - coords[i][1]) * 111_000;
+      if (dx * dx + dy * dy > ADJ_M2) continue; // discontinuous → ghost prefix
+    }
+    fromIdx = i;
+    break;
+  }
+  if (fromIdx === -1) {
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < toIdx; i++) {
+      const d = sqMeters(i, from.lat, from.lon);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    fromIdx = best;
+  }
+  if (fromIdx >= toIdx) return coords;
+  return coords.slice(fromIdx, toIdx + 1);
+}
+
 function slimLeg(leg: Leg): SlimLeg {
+  const rawCoords = leg.legGeometry?.points
+    ? decodePolyline(leg.legGeometry.points, leg.legGeometry.precision ?? 7)
+    : [];
+  const isStreet = leg.mode === "WALK" || leg.mode === "BIKE";
+  const coords = isStreet ? rawCoords : trimLegGeometry(rawCoords, leg.from, leg.to);
   return {
     mode: leg.mode,
     duration: leg.duration,
@@ -37,7 +104,7 @@ function slimLeg(leg: Leg): SlimLeg {
     routeShortName: leg.routeShortName,
     routeLongName: leg.routeLongName,
     routeColor: leg.routeColor,
-    coords: leg.legGeometry?.points ? decodePolyline(leg.legGeometry.points, leg.legGeometry.precision ?? 7) : [],
+    coords,
   };
 }
 
@@ -81,6 +148,17 @@ export async function GET(req: Request) {
   const time = url.searchParams.get("time") ?? new Date().toISOString();
   const modeParam = url.searchParams.get("mode");
   const mode: "walk" | "bike" = modeParam === "bike" ? "bike" : "walk";
+  // Optional best-case search: when on, MOTIS scans a wide departure
+  // window (default 24h) instead of its 15-min default. Without this the
+  // route is locked to whichever single train is closest to `time`, so
+  // it can disagree with the polygon — the polygon samples the whole
+  // operating day for stop reach, but a "now" plan picks one departure.
+  // The client sends `time` = local 5am of the selected date when
+  // best-case is on, so the window covers 5am–5am.
+  const searchWindowRaw = Number(url.searchParams.get("searchWindow"));
+  const searchWindow = Number.isFinite(searchWindowRaw) && searchWindowRaw > 0
+    ? Math.min(searchWindowRaw, 24 * 3600)
+    : undefined;
 
   if (!Number.isFinite(fromLat) || !Number.isFinite(fromLon)) {
     return NextResponse.json({ error: "fromLat/fromLon required" }, { status: 400 });
@@ -120,10 +198,16 @@ export async function GET(req: Request) {
       detailedTransfers: true,
       useRoutedTransfers: true,
       maxTransfers: 3,
-      timetableView: false,
+      // timetableView is required for searchWindow to fan out across the
+      // day; without it MOTIS picks one Pareto-optimal answer near `time`
+      // and ignores the rest of the window. Off when no window override
+      // (matches the previous behavior so a normal "leave now" plan stays
+      // single-departure cheap).
+      timetableView: searchWindow != null,
       // Give direct non-transit up to ~60min so bike/walk-only for short
       // trips shows up even when a transit option exists.
       maxDirectTime: 60 * 60,
+      ...(searchWindow != null ? { searchWindow, numItineraries: 20 } : {}),
     },
   });
   const reverseGeocodePromise: Promise<string | undefined> = toStop
