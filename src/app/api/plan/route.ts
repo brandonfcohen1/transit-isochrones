@@ -124,8 +124,9 @@ function slimItinerary(it: Itinerary): SlimItinerary {
 // Returns { itineraries: SlimItinerary[], direct: SlimItinerary[] }.
 // Itineraries include full leg geometry (decoded polyline → [lon,lat] coords)
 // so the client can draw them as GeoJSON without further processing.
+// Keep in sync with isochrone/route.ts and data/septa-region.osm.pbf's bbox.
 function inCoverage(lat: number, lon: number): boolean {
-  return lat >= 39.3 && lat <= 40.5 && lon >= -76.0 && lon <= -74.4;
+  return lat >= 39.55 && lat <= 40.45 && lon >= -76.0 && lon <= -74.65;
 }
 
 export async function GET(req: Request) {

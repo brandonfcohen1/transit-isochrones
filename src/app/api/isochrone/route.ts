@@ -151,11 +151,13 @@ export async function GET(req: Request) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return NextResponse.json({ error: "lat and lon required" }, { status: 400 });
   }
-  // Coverage-area bbox. Generous envelope around SEPTA service area
-  // (Wilmington DE → N. Trenton NJ, Lancaster PA → W. Jersey). Out-of-
-  // area origins otherwise consume a timesCsv fan-out of oneToAll calls
-  // before MOTIS returns empty — cheap DoS vector.
-  if (lat < 39.3 || lat > 40.5 || lon < -76.0 || lon > -74.4) {
+  // Coverage-area bbox. Tracks the OSM extract baked into the MOTIS
+  // dataset (5 PA counties + Wilmington/Newark DE + Trenton NJ — i.e.
+  // SEPTA's Regional Rail terminal envelope). Out-of-area origins
+  // otherwise consume a timesCsv fan-out of oneToAll calls before MOTIS
+  // returns empty — cheap DoS vector. Keep this in sync with
+  // data/septa-region.osm.pbf's bbox.
+  if (lat < 39.55 || lat > 40.45 || lon < -76.0 || lon > -74.65) {
     return NextResponse.json({ error: "origin outside coverage area" }, { status: 400 });
   }
   if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 60) {
