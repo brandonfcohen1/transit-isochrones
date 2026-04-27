@@ -9,10 +9,12 @@
     "lint": "eslint",
     "build:routes": "bun scripts/build-routes-geojson.ts",
     "pack:motis": "bun scripts/pack-motis-dataset.ts",
+    "deploy": "wrangler deploy",
     "bench": "bun bench/run.ts",
     "test:coverage": "bun scripts/test-coverage.ts"
   },
   "dependencies": {
+    "@cloudflare/containers": "^0.3.3",
     "@motis-project/motis-client": "^2.9.2",
     "@turf/buffer": "^7.3.4",
     "@turf/clean-coords": "^7.3.4",
@@ -27,6 +29,7 @@
     "react-dom": "19.2.4"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251108.0",
     "@tailwindcss/postcss": "^4",
     "@types/d3-contour": "^3.0.6",
     "@types/node": "^20",
@@ -35,7 +38,8 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.3",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.50.0"
   },
   "ignoreScripts": [
     "sharp",

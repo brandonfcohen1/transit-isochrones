@@ -26,50 +26,22 @@ curl -L -o data/pennsylvania-latest.osm.pbf https://download.geofabrik.de/north-
 # config.yml is already checked in under data/ with SEPTA-tuned settings.
 ```
 
-## Deploy: single container (production)
+## Deploy
 
-Builds MOTIS + the Next.js app into one image running under supervisord. Two ways to provision the MOTIS dataset:
-
-### (a) Bind-mount, build the graph on the deploy box
-
-For boxes with ≥4 GB free RAM during import. The graph build takes 5–15 min and is a one-time cost.
+Cloudflare Workers + Containers, scale-to-zero. ~$5/mo at hobby usage.
+End-to-end instructions in [`deploy/README.md`](deploy/README.md). The
+short version:
 
 ```bash
-docker build -t septa-iso .
-docker run --rm -v $(pwd)/data:/workspace -w /workspace septa-iso /motis import
-docker run -d --name septa-iso --restart unless-stopped \
-  -v $(pwd)/data:/workspace -p 3000:3000 \
-  septa-iso
+bunx wrangler login          # one-time
+bun run pack:motis           # builds dist/motis-dataset.tar.gz from data/data
+bun run deploy               # = wrangler deploy
 ```
 
-### (b) Pre-built dataset, fetched on boot
-
-Best for small VMs (Hetzner CX22 at $4/mo, etc.) that can't run `motis import` themselves — the import peaks at 4–8 GB RAM. The operator imports on a beefy machine once, packs the dataset into a tarball, uploads to object storage, and points the deploy at it.
-
-```bash
-# Locally (one-time, on a machine with ≥8 GB RAM):
-docker run --rm -v $(pwd)/data:/workspace -w /workspace septa-iso /motis import
-bun run pack:motis                                 # → dist/motis-dataset.tar.gz (~360 MB)
-rclone copy dist/motis-dataset.tar.gz r2:bucket/   # or aws s3 cp …
-
-# On the deploy box:
-docker run -d --name septa-iso --restart unless-stopped \
-  -v septa-data:/workspace \
-  -e MOTIS_DATASET_URL=https://your-bucket.r2.dev/motis-dataset.tar.gz \
-  -p 3000:3000 \
-  septa-iso
-```
-
-The container's `motis-bootstrap.sh` fetches and extracts on first start (~60–90 s for 360 MB). A `.bootstrapped` marker on the volume prevents re-fetch on restarts. Re-import locally + re-upload + delete the marker (or wipe the volume) when you want to refresh GTFS.
-
-Either way, `:3000` exposes Next.js; MOTIS sits on `127.0.0.1:8080` inside the container. First request after cold boot waits ~30 s for MOTIS to load its graph. Docker healthcheck probes `/api/health`.
-
-For HTTPS on a VPS, front this with Caddy or Traefik. A two-line Caddyfile gets you Let's Encrypt automatically:
-```
-your-domain.com {
-  reverse_proxy localhost:3000
-}
-```
+Wrangler builds the Dockerfile (which bakes the dataset into the image
+so cold starts skip the runtime fetch), pushes to CF's container
+registry, and hooks up the Worker that fronts the container. First
+deploy lands at `https://transit-isochrones.<your-account>.workers.dev`.
 
 ## Dev: multi-service compose
 
@@ -91,7 +63,8 @@ Open http://localhost:3000.
 { "ok": true, "motis": { "ok": true, "status": 404 }, "caches": { ... }, "uptimeSec": 123, "probeMs": 18 }
 ```
 
-Returns 503 when MOTIS isn't reachable. Suitable for Render/Kubernetes readiness probes.
+Returns 503 when MOTIS isn't reachable. The client polls this on mount
+to drive the warm-up banner during a CF Container cold start.
 
 ## Scripts
 
@@ -99,6 +72,8 @@ Returns 503 when MOTIS isn't reachable. Suitable for Render/Kubernetes readiness
 bun run dev               # Next dev server
 bun run build             # Next production build
 bun run build:routes      # Rebuild public/septa-routes.geojson from GTFS
+bun run pack:motis        # Pack data/data → dist/motis-dataset.tar.gz
+bun run deploy            # wrangler deploy (Cloudflare Containers)
 bun run bench             # Isochrone latency bench (see bench/PLAN.md)
 bun run test:coverage     # Golden-set rail-coverage regression test
 ```
@@ -108,15 +83,9 @@ bun run test:coverage     # Golden-set rail-coverage regression test
 | var | default | notes |
 |---|---|---|
 | `MOTIS_URL` | `http://localhost:8080` | Server-side. Don't prefix with `NEXT_PUBLIC_`; keeps the URL out of the browser bundle. |
-| `MOTIS_CONCURRENCY` | `32` | Global in-flight cap for MOTIS calls. Drop to 8–16 if MOTIS runs on a smaller remote box. |
+| `MOTIS_CONCURRENCY` | `32` | Global in-flight cap for MOTIS calls. Drop to 8–16 on the `basic` CF instance type to flatten peak RAM. |
 | `MOTIS_TIMEOUT_MS` | `20000` | Per-call timeout on every MOTIS request. |
 | `NEXT_PUBLIC_MAPTILER_KEY` | — | Optional. Without it, falls back to `demotiles.maplibre.org` (visibly low-fi). |
-
-## Deploy notes
-
-- **Single-box** (Hetzner CX22, $4/mo, 4 GB, 2 vCPU): use deploy path (b) above. The 4–8 GB RAM `motis import` peak doesn't run on the box; you ship a pre-built tarball. MOTIS server steady-state sits at ~1.5 GB resident, leaving ~2 GB for Next.js + OS.
-- **Two-box** (any tiny app host + a beefier MOTIS box): set `MOTIS_URL` on the app to MOTIS's private hostname. Lets a 512 MB app dyno on Render Starter front a separate MOTIS box.
-- **CDN**: `Cache-Control: public, max-age=60, s-maxage=300` on `/api/isochrone` lets a CDN (Cloudflare free tier) absorb repeat hits.
 
 ## Notable design decisions
 
@@ -151,6 +120,13 @@ bench/
   results/                  # persisted bench JSON for diffing runs
 scripts/
   build-routes-geojson.ts   # builds public/septa-routes.geojson from GTFS
+  pack-motis-dataset.ts     # tars+gzips data/data → dist/motis-dataset.tar.gz
   test-coverage.ts          # golden-set rail-coverage regression test
-data/                       # gitignored — MOTIS inputs and graph
+worker/
+  index.ts                  # CF Worker entry; forwards to the named Container
+deploy/
+  README.md                 # CF Containers deploy guide
+wrangler.jsonc              # CF Worker + Container config
+data/                       # mostly gitignored — MOTIS inputs and graph
+data/config.yml             # tracked; the input MOTIS reads at import
 ```

@@ -35,12 +35,10 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
-!deploy/.env.example
 
-# Deploy cloud-init has the operator's real SSH public key + email
-# embedded; keep that out of the public repo. cloud-init.yml.example is
-# the placeholder template — copy + edit + paste into Hetzner.
-/deploy/cloud-init.yml
+# Cloudflare Wrangler local state
+.wrangler/
+.dev.vars
 
 # vercel
 .vercel

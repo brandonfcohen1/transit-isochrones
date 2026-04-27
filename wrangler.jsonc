@@ -1,0 +1,40 @@
+// Cloudflare Workers + Containers config.
+//
+// Deploy: `wrangler deploy` (after `bun run pack:motis` to produce the
+// dataset tarball the Dockerfile bakes in).
+//
+// The Container is fronted by the Worker in worker/index.ts: every
+// request gets routed to a single named instance, which keeps MOTIS's
+// graph hot across requests instead of cold-starting per request.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "transit-isochrones",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    {
+      "class_name": "App",
+      "image": "./Dockerfile",
+      "max_instances": 1,
+      // basic = 1 GB RAM, 1/4 vCPU. MOTIS peaks ~406 MB; app ~200 MB.
+      // Bump to "standard" (4 GB, 1/2 vCPU) for tighter query latency.
+      "instance_type": "basic"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "APP", "class_name": "App" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["App"] }
+  ],
+  "observability": {
+    "enabled": true
+  }
+  // Custom domain (optional — defaults to <name>.<account>.workers.dev):
+  // "routes": [
+  //   { "pattern": "transit-isochrones.example.com/*", "zone_name": "example.com" }
+  // ]
+}

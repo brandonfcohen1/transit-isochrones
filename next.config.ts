@@ -38,6 +38,14 @@ const nextConfig: NextConfig = {
   // Drops ~200MB off the Docker image vs shipping the full
   // node_modules tree, and makes the deploy one-file.
   output: "standalone",
+  // Cap "Collecting page data" parallelism. Default is # of CPUs (8+),
+  // and each worker eats ~300 MB during page collection. In a memory-
+  // constrained build container (e.g. Docker Desktop default), the
+  // cumulative footprint OOMs the build. We have 7 routes total, so
+  // 2 workers is plenty.
+  experimental: {
+    cpus: 2,
+  },
   async headers() {
     return [
       {

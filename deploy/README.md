@@ -1,169 +1,146 @@
-# Deploy: Hetzner CPX11 + Cloudflare R2
+# Deploy: Cloudflare Workers + Containers
 
-End-to-end deploy of the SEPTA isochrone app to a single $4/mo VPS, with
-the MOTIS dataset hosted on Cloudflare R2 (free tier).
+Single-image deploy to Cloudflare Containers, scale-to-zero. The MOTIS
+dataset is baked into the Docker image so cold starts skip the runtime
+fetch (CF gives every cold start an ephemeral disk).
 
-**What you'll need:**
-- Hetzner Cloud account ([hetzner.com/cloud](https://hetzner.com/cloud))
-- Cloudflare account with R2 enabled (free)
-- A domain you control, with a DNS A record you can edit
-- ssh keypair on your laptop (`~/.ssh/id_ed25519.pub` or similar)
-- This repo on a git host (so the server can `git clone` it)
+**Recurring cost:** ~$5.32/mo on a hobby usage profile (Workers Paid
+$5/mo + ~$0.32 in metered memory above the free tier). Always-on is
+~$11.59/mo if you'd rather skip the cold-start UX.
 
-**Time:** ~30 min the first time, ~5 min for subsequent code deploys.
+**One-time prep on your laptop (~10 min):**
 
-**Recurring cost:** $4.13/mo (Hetzner CPX11) + $0 (R2 under free tier) = **$4.13/mo**.
+1. Install wrangler and authenticate:
+   ```bash
+   bun install                       # gets wrangler + @cloudflare/containers
+   bunx wrangler login               # opens browser, OAuth flow
+   ```
 
----
+2. Build the MOTIS graph and pack it into the tarball that the Dockerfile bakes in. This step needs ~6 GB free RAM (don't run on a tiny VM):
+   ```bash
+   # Refresh source data (skip if data/ already populated):
+   mkdir -p data
+   curl -L -o data/septa-gtfs.zip https://www3.septa.org/developer/gtfs_public.zip
+   unzip -p data/septa-gtfs.zip google_bus.zip > data/google_bus.zip
+   unzip -p data/septa-gtfs.zip google_rail.zip > data/google_rail.zip
+   curl -L -o data/pennsylvania-latest.osm.pbf \
+     https://download.geofabrik.de/north-america/us/pennsylvania-latest.osm.pbf
 
-## 0. One-time, on your laptop
+   # Clip OSM to the SEPTA region (~84 MB instead of 333):
+   osmium extract --bbox=-76.0,39.55,-74.65,40.45 \
+     data/pennsylvania-latest.osm.pbf -o data/septa-region.osm.pbf
 
-### Build and pack the MOTIS dataset
+   # Build the MOTIS graph:
+   docker compose run --rm -w /workspace motis /motis import
 
-This needs ~6 GB free RAM (don't run on a small VPS). Output is the
-`dist/motis-dataset.tar.gz` you'll upload to R2.
+   # Patch onetomany_max_many in the baked config (MOTIS rebakes a copy at import):
+   sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' \
+     data/data/config.yml
 
-```bash
-# Refresh the source data (skip if data/ is already populated):
-mkdir -p data
-curl -L -o data/septa-gtfs.zip https://www3.septa.org/developer/gtfs_public.zip
-unzip -p data/septa-gtfs.zip google_bus.zip > data/google_bus.zip
-unzip -p data/septa-gtfs.zip google_rail.zip > data/google_rail.zip
-curl -L -o data/pennsylvania-latest.osm.pbf \
-  https://download.geofabrik.de/north-america/us/pennsylvania-latest.osm.pbf
+   # Pack into the tarball that the Dockerfile bakes in:
+   bun run pack:motis
+   ls -lh dist/motis-dataset.tar.gz   # ~120 MB
+   ```
 
-# Clip OSM to the SEPTA region (~84 MB instead of 333):
-osmium extract --bbox=-76.0,39.55,-74.65,40.45 \
-  data/pennsylvania-latest.osm.pbf -o data/septa-region.osm.pbf
+3. Deploy:
+   ```bash
+   bun run deploy
+   # equivalent to: bunx wrangler deploy
+   ```
 
-# Build the MOTIS graph:
-docker compose run --rm -w /workspace motis /motis import
+   First deploy takes ~5 min: wrangler builds the Dockerfile (Next.js
+   compile + dataset bake), pushes the image to CF's registry, and
+   provisions the Worker + Container binding. You'll see the deploy URL
+   at the end (`https://transit-isochrones.<your-account>.workers.dev`).
 
-# Patch onetomany_max_many in the baked config (MOTIS bakes a copy at import):
-sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' \
-  data/data/config.yml
+4. Open the URL. The page loads, the warm-up banner shows for ~25 s
+   while MOTIS mmaps the graph, then disappears. Click around.
 
-# Pack into a tarball:
-bun run pack:motis
-ls -lh dist/motis-dataset.tar.gz   # ~120 MB after the tuning knobs in data/config.yml
-```
+That's it. No DNS, no TLS, no ssh, no cron job.
 
-### Upload the tarball to R2
+## Custom domain
 
-In the Cloudflare dashboard: **R2** → **Create bucket** (any name; e.g. `septa-iso-data`). Then upload `dist/motis-dataset.tar.gz`. Two paths:
+If you want `transit-isochrones.your-domain.com` instead of the
+`workers.dev` URL:
 
-**A. Public bucket** (simplest): in the bucket's **Settings** tab, enable **R2.dev subdomain**. The file is reachable at `https://pub-<hash>.r2.dev/motis-dataset.tar.gz`. No auth.
+1. Add your domain to Cloudflare (Sites → Add Site).
+2. Uncomment the `routes` block in `wrangler.jsonc` and set both fields.
+3. `bun run deploy` again.
 
-**B. Custom domain or signed URL**: skip if A is fine for a hobby app. The file is just SEPTA's public GTFS + a public OSM extract — there's nothing sensitive to hide.
+CF auto-provisions the cert. You don't see Let's Encrypt anywhere in
+this flow.
 
-Note the URL — it goes in the server's `.env` as `MOTIS_DATASET_URL`.
-
----
-
-## 1. Create the server
-
-Hetzner Cloud console → **Add Server**:
-
-- **Location**: Ashburn (closest to Philly users)
-- **Image**: Ubuntu 24.04
-- **Type**: **CPX11** ($4.13/mo, 2 vCPU AMD, 2 GB RAM, 40 GB SSD). CX22 ($4.51) also works if you want extra headroom.
-- **Networking**: leave IPv4 + IPv6 enabled
-- **Cloud config**: copy `deploy/cloud-init.yml.example` to `deploy/cloud-init.yml` (gitignored), edit the `ssh_authorized_keys` line to your real public key (`cat ~/.ssh/id_ed25519.pub`), then paste the contents into Hetzner's User Data field.
-- **Name**: `septa-iso`
-- Click **Create**
-
-Hetzner gives you a public IPv4 immediately. Cloud-init runs in the
-background for ~3–5 min after boot. While that runs:
-
-### Point DNS at the server
-
-In your DNS provider, create an A record:
-```
-septa-iso.your-domain.com  →  <server-ip-from-hetzner>
-```
-TTL 300 is fine. Wait for it to propagate (`dig septa-iso.your-domain.com` should return the new IP).
-
----
-
-## 2. Deploy the app
-
-ssh in (cloud-init has finished when this works without password):
-
-```bash
-ssh deploy@<server-ip>
-git clone https://github.com/brandonfcohen1/transit-isochrones
-cd transit-isochrones/deploy
-cp .env.example .env
-$EDITOR .env                  # paste the R2 URL into MOTIS_DATASET_URL
-$EDITOR Caddyfile             # replace example.com with your domain + email
-docker compose -f docker-compose.prod.yml up -d --build
-```
-
-The first `up -d --build` takes ~5 min: Next.js builds (~3 min, peaks
-~1.5 GB swap-assisted), the image is assembled, the container starts,
-the bootstrap fetches the ~120 MB tarball from R2, MOTIS mmaps the graph.
-Caddy hits Let's Encrypt and gets a real cert in ~30 s once your DNS
-points at the server.
-
-Watch it come up:
-```bash
-docker compose -f docker-compose.prod.yml logs -f
-```
-
-When `app` reports `MOTIS up` and `Ready`, hit `https://septa-iso.your-domain.com` in a browser. Done.
-
----
-
-## 3. Recurring tasks
+## Recurring tasks
 
 ### Deploy a code change
 
 ```bash
-ssh deploy@<server-ip>
-cd transit-isochrones
-git pull
-cd deploy
-docker compose -f docker-compose.prod.yml up -d --build
+bun run deploy
 ```
 
-`build` only rebuilds the Next.js layer when source changed; ~1–2 min.
+Wrangler diffs the image; if only Next.js source changed (no Dockerfile
+change), the Next.js layer rebuilds and the dataset layer is reused
+from cache. ~1–2 min.
 
 ### Refresh the MOTIS dataset (new GTFS, etc.)
 
-On your laptop:
 ```bash
-# Re-import + re-pack + re-upload (overwrite the same R2 object)
+# Re-import + re-pack:
 docker compose run --rm -w /workspace motis /motis import
 sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' data/data/config.yml
 bun run pack:motis
-rclone copy dist/motis-dataset.tar.gz r2:septa-iso-data/
+# Re-deploy bakes the new tarball into the image:
+bun run deploy
 ```
 
-On the server:
+### Tail logs
+
 ```bash
-ssh deploy@<server-ip>
-cd transit-isochrones/deploy
-docker compose -f docker-compose.prod.yml down app
-docker volume rm deploy_workspace   # forces re-fetch
-docker compose -f docker-compose.prod.yml up -d app
+bunx wrangler tail
 ```
 
-### OS updates
+Streams stdout/stderr from the running container in real time.
 
-`unattended-upgrades` from cloud-init handles security patches. For
-kernel updates that need a reboot, ssh in once a quarter:
-```bash
-sudo apt update && sudo apt upgrade -y && sudo reboot
-```
+### Inspect / scale instance type
 
----
+`wrangler.jsonc` → `containers[0].instance_type`:
+- `dev` (256 MB, 1/16 vCPU) — too small for MOTIS.
+- `basic` (1 GB, 1/4 vCPU) — current default; fits MOTIS + app comfortably.
+- `standard` (4 GB, 1/2 vCPU) — for tighter polygon latency under load.
+
+Edit and `bun run deploy`.
+
+## How the warm-up flow works
+
+1. CF Container is asleep (no requests for `sleepAfter` = 5 min).
+2. User visits the page → Worker forwards to the container → container starts.
+3. Next.js is ready in ~3 s and serves the HTML.
+4. The page mounts and immediately fires `/api/health`. That request is
+   what wakes MOTIS — the response will be 503 until MOTIS finishes
+   mmap'ing the graph (~25 s after process start).
+5. The Map UI shows an amber "Warming up — first query ready in ~30 s"
+   banner. Polls `/api/health` every 2 s.
+6. As soon as MOTIS reports ready, banner clears. The user has been
+   exploring the UI in the meantime, so when they click Run, MOTIS is hot.
+
+Net cold-start UX: ~3 s of "blank page", then HTML loads, then ~25 s
+with the banner — but the user can interact with the slider, mode
+toggles, etc. during that window. By the time they pin an origin and
+hit Run, the polygon comes back at normal latency.
 
 ## Troubleshooting
 
-**Caddy says "no such host" or self-signs the cert.** DNS hadn't propagated when Caddy started its ACME challenge. Wait, then `docker compose restart caddy`.
+**`wrangler deploy` fails on `COPY dist/motis-dataset.tar.gz`.** You
+forgot `bun run pack:motis`. The Dockerfile requires the file to exist.
 
-**`/api/health` returns 503.** MOTIS hasn't loaded yet (first boot fetches the tarball + mmaps the graph; ~60–90 s). Tail `docker compose logs -f app` and look for `motis.server`.
+**Container won't start, logs say `motis import` errors.** The dataset
+in the image is corrupt or built against a different MOTIS version.
+Re-import locally and re-deploy.
 
-**OOM during `--build`.** Cloud-init should have created 2 GB swap; check `free -h`. If swap is missing for some reason: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
+**`/api/health` keeps 503'ing past 60 s.** Container ran out of
+memory — `basic` (1 GB) might be too small under load. Bump
+`instance_type` to `standard` and redeploy.
 
-**Anything weird and you want to start over.** From the Hetzner console: delete the server (€0.001/h hourly billing — only what you used), create a new one with the same cloud-init. The R2 dataset persists.
+**Cold-start banner shows on every visit, even right after one.** Your
+`sleepAfter` is too short for typical session gaps. Bump from `5m` to
+`15m` or `1h` in `worker/index.ts`.
