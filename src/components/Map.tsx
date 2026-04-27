@@ -188,8 +188,34 @@ export default function Map() {
   const [metroEnabled, setMetroEnabled] = useState(true);
   const [railEnabled, setRailEnabled] = useState(true);
 
+  // Backend cold-start state. CF Containers (and other scale-to-zero
+  // hosts) sleep MOTIS when idle; the first request wakes the container
+  // and MOTIS needs ~25 s to mmap the graph. We fire /api/health on
+  // mount so the wake happens *during* the user's UI exploration rather
+  // than after their first Run click. Polling every 2 s is cheap and
+  // becomes a no-op once MOTIS reports ready.
+  const [warming, setWarming] = useState(true);
+
   useEffect(() => {
     setDeparture(nowLocalInputValue());
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    let timer: number | null = null;
+    const poll = async () => {
+      if (!alive) return;
+      try {
+        const r = await fetch("/api/health", { cache: "no-store" });
+        if (alive && r.ok) {
+          const d = (await r.json()) as { motis?: { ok?: boolean } };
+          if (d.motis?.ok) { setWarming(false); return; }
+        }
+      } catch { /* network or container still spinning up — keep polling */ }
+      if (alive) timer = window.setTimeout(poll, 2_000);
+    };
+    poll();
+    return () => { alive = false; if (timer != null) window.clearTimeout(timer); };
   }, []);
 
   // URL-hash state sync. Hash format:
@@ -973,6 +999,12 @@ export default function Map() {
           >
             Dismiss
           </button>
+        </div>
+      )}
+      {warming && !errorMsg && (
+        <div className="absolute top-4 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 shadow dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+          <span>Warming up the routing engine — first query will be ready in ~30 s.</span>
         </div>
       )}
       {(loading || stopCount !== null) && (
