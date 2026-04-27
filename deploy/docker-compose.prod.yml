@@ -1,0 +1,80 @@
+# Production compose for the single-box VPS deploy.
+#
+# The `app` service is the same image as `docker run septa-iso` —
+# supervisord runs MOTIS + Next.js side-by-side inside one container,
+# and motis-bootstrap.sh fetches MOTIS_DATASET_URL on first boot.
+# Caddy fronts it for TLS.
+#
+# Bring up:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Logs:
+#   docker compose -f docker-compose.prod.yml logs -f app
+#   docker compose -f docker-compose.prod.yml logs -f caddy
+#
+# Refresh MOTIS dataset (after re-pack + re-upload to R2):
+#   docker compose -f docker-compose.prod.yml down app
+#   docker volume rm deploy_workspace
+#   docker compose -f docker-compose.prod.yml up -d app
+#
+# Pull a new app build (if you've pushed a new image):
+#   docker compose -f docker-compose.prod.yml pull app
+#   docker compose -f docker-compose.prod.yml up -d app
+
+services:
+  app:
+    # Build from the repo root. The Dockerfile produces a single image
+    # with MOTIS + Next.js under supervisord. ~3-5 min on a CPX11 (peaks
+    # ~1.5 GB RAM during Next.js build — swap absorbs it).
+    #
+    # If you'd rather push a pre-built image to ghcr.io and pull here,
+    # comment out `build:` and set `image: ghcr.io/<you>/septa-iso:latest`.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: septa-iso:latest
+    restart: unless-stopped
+    environment:
+      # Where the bootstrap fetches the MOTIS dataset from on first boot.
+      # See deploy/.env.example for setup.
+      MOTIS_DATASET_URL: ${MOTIS_DATASET_URL}
+      # Tells the Next.js handlers where MOTIS is. supervisord runs both
+      # processes in this container, so 127.0.0.1:8080 is right.
+      MOTIS_URL: http://127.0.0.1:8080
+      # Lower than the default 32. CPX11 has 2 vCPU; 8 in-flight is plenty
+      # and keeps MOTIS RSS comfortably under 400 MB even under burst load.
+      MOTIS_CONCURRENCY: ${MOTIS_CONCURRENCY:-8}
+      NODE_ENV: production
+      # Optional: a real MapTiler key gets you a nicer basemap; without
+      # one the app falls back to demotiles.maplibre.org.
+      NEXT_PUBLIC_MAPTILER_KEY: ${NEXT_PUBLIC_MAPTILER_KEY:-}
+    volumes:
+      # Persistent so the .bootstrapped marker survives restarts and we
+      # don't re-fetch the 145 MB tarball every time the container cycles.
+      - workspace:/workspace
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s   # MOTIS needs ~30 s to mmap the graph after fetch
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  workspace:
+  caddy_data:
+  caddy_config:

@@ -35,6 +35,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!deploy/.env.example
 
 # vercel
 .vercel
@@ -43,8 +44,11 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# MOTIS data (downloaded GTFS + OSM + generated graph)
-/data/
+# MOTIS data (downloaded GTFS + OSM + generated graph). config.yml is
+# the input MOTIS reads at import — track that one file so the tuning
+# knobs (railviz off, num_days=30, etc.) survive a fresh clone.
+/data/*
+!/data/config.yml
 /motis-data/
 
 # Claude Code session state

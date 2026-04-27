@@ -1,0 +1,22 @@
+# Caddy config for septa-iso. Two lines do the work:
+#   - the global `email` directive lets Let's Encrypt contact you about
+#     cert issues. Replace with yours, or omit and Caddy uses an
+#     anonymous account (still works).
+#   - the site block reverse-proxies to the app container on the
+#     internal compose network. Caddy auto-fetches and renews a
+#     Let's Encrypt cert for the named domain.
+#
+# After editing, reload without a restart:
+#   docker compose -f docker-compose.prod.yml exec caddy caddy reload --config /etc/caddy/Caddyfile
+
+{
+  email REPLACE_ME@example.com
+}
+
+# REPLACE with your domain. DNS A record must point to the server's
+# public IP before Caddy starts, or the ACME challenge fails and Caddy
+# falls back to a self-signed cert.
+septa-iso.example.com {
+  encode gzip zstd
+  reverse_proxy app:3000
+}

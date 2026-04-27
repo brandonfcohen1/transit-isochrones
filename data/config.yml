@@ -1,0 +1,62 @@
+osm: septa-region.osm.pbf
+# No tiles section — MapLibre uses its own basemap, MOTIS just serves the routing API.
+timetable:
+  # Max destinations per /api/v1/one-to-many call. Default 128 forces
+  # the precise-streets isochrone grid into ~3-10 batches per query;
+  # 1024 lets a walk-30min or bike-30min grid go in a single call.
+  # Also needs to be patched in /workspace/data/config.yml after
+  # `motis import` bakes a copy into the dataset dir.
+  onetomany_max_many: 1024
+  first_day: TODAY
+  # 30 days is plenty for a "leave now" UX — users don't plan more than
+  # 4 weeks out. Halving from 60 cuts ~5-15 MB off the timetable indices.
+  num_days: 30
+  tb: true
+  # railviz is the live-train-positions feature; we don't expose it.
+  # Disabling drops shape_route_segment_bboxes (~37 MB on disk) plus
+  # the in-memory indices.
+  railviz: false
+  with_shapes: true
+  adjust_footpaths: true
+  merge_dupes_intra_src: false
+  merge_dupes_inter_src: false
+  link_stop_distance: 100
+  update_interval: 60
+  http_timeout: 30
+  canned_rt: false
+  incremental_rt_update: false
+  use_osm_stop_coordinates: false
+  extend_missing_footpaths: false
+  max_footpath_length: 15
+  max_matching_distance: 25.000000
+  preprocess_max_matching_distance: 250.000000
+  datasets:
+    googlebus:
+      path: google_bus.zip
+      default_bikes_allowed: false
+      default_cars_allowed: false
+      extend_calendar: false
+    googlerail:
+      path: google_rail.zip
+      default_bikes_allowed: false
+      default_cars_allowed: false
+      extend_calendar: false
+elevators: false
+street_routing: true
+# osr_footpath=true is required for `oneToAll` / `plan` to find rail
+# stops from arbitrary coord origins — RR platforms often sit >100m
+# from the nearest OSM-mapped walkable way, and the default simple
+# matching leaves them disconnected. Cost: the experimental
+# `/api/experimental/one-to-many-intermodal` endpoint becomes less
+# accurate (doubled transit durations, identity-query noise). Our
+# graph isochrone compensates by rasterizing walking-radius disks
+# around every reachable rail stop reported by `oneToAll` (see the
+# `reachAnchors` param in src/lib/graphIsochrone.ts), so rail reach
+# appears in the polygon even though intermodal alone misses it.
+osr_footpath: true
+# Geocoding builds an address index ('adr/' = ~68 MB on disk + comparable
+# in RAM). We only used reverseGeocode in /api/plan to label free-coord
+# destinations; that call already catches errors and falls back to
+# undefined name, so disabling degrades gracefully.
+geocoding: false
+reverse_geocoding: false
