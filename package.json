@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "build:routes": "bun scripts/build-routes-geojson.ts",
+    "pack:motis": "bun scripts/pack-motis-dataset.ts",
     "bench": "bun bench/run.ts",
     "test:coverage": "bun scripts/test-coverage.ts"
   },

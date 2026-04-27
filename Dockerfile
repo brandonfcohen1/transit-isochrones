@@ -2,16 +2,22 @@
 #
 # Layout:
 #   /motis           — MOTIS binary (from base image)
-#   /workspace       — mounted by the operator; contains MOTIS data dir + GTFS/OSM
+#   /workspace       — bind-mount or fetched at boot; contains MOTIS data dir
 #   /app             — Next.js standalone bundle
 #
-# One-time graph build (operator runs this once against the same image).
-# Needs `-w /workspace` so MOTIS writes the preprocessed graph next to
-# the mounted data files:
-#   docker run --rm -v $(pwd)/data:/workspace -w /workspace septa-iso /motis import
+# Two ways to provision the MOTIS dataset:
 #
-# Daily run:
-#   docker run -d -v $(pwd)/data:/workspace -p 3000:3000 septa-iso
+#   (a) Build locally, bind-mount (best for development):
+#         docker run --rm -v $(pwd)/data:/workspace -w /workspace septa-iso /motis import
+#         docker run -d -v $(pwd)/data:/workspace -p 3000:3000 septa-iso
+#
+#   (b) Pre-build, host on object storage, fetch at boot (best for cloud
+#       deploy on small VMs that can't run `motis import` themselves):
+#         bun run pack:motis            # → dist/motis-dataset.tar.gz
+#         rclone copy dist/motis-dataset.tar.gz r2:bucket/  # or aws s3 cp …
+#         docker run -d -e MOTIS_DATASET_URL=https://… -p 3000:3000 septa-iso
+#       The container's motis-bootstrap.sh fetches and extracts on first
+#       start. Subsequent restarts skip the fetch via .bootstrapped marker.
 
 # ─── Stage 1: build the Next.js app ─────────────────────────────────
 FROM oven/bun:1 AS app-build
@@ -45,6 +51,8 @@ COPY --from=app-build /app/.next/static ./.next/static
 COPY --from=app-build /app/public ./public
 
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY scripts/motis-bootstrap.sh /usr/local/bin/motis-bootstrap.sh
+RUN chmod +x /usr/local/bin/motis-bootstrap.sh
 
 # MOTIS_URL is set per-process in supervisord.conf; no need to export
 # globally. PORT is 3000 by default (matches supervisord's HOSTNAME).

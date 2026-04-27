@@ -19,6 +19,9 @@
 
 # production
 /build
+# Pre-built MOTIS dataset tarball produced by `bun run pack:motis`.
+# Uploaded to object storage; the deploy fetches it on boot.
+/dist
 
 # misc
 .DS_Store
