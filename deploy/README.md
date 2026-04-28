@@ -1,74 +1,107 @@
 # Deploy: Cloudflare Workers + Containers
 
-Single-image deploy to Cloudflare Containers, scale-to-zero. The MOTIS
-dataset is baked into the Docker image so cold starts skip the runtime
-fetch (CF gives every cold start an ephemeral disk).
+Single-image scale-to-zero deploy. The MOTIS dataset is baked into the
+Docker image at build time, so cold starts skip any runtime fetch — CF
+gives every cold start an ephemeral disk, but the dataset is already
+there in the image layer.
 
-**Recurring cost:** ~$5.32/mo on a hobby usage profile (Workers Paid
-$5/mo + ~$0.32 in metered memory above the free tier). Always-on is
-~$11.59/mo if you'd rather skip the cold-start UX.
+**Recurring cost:** ~$5.32/mo at hobby usage profile (Workers Paid base
+$5/mo + ~$0.32 in metered memory above the free tier).
 
-**One-time prep on your laptop (~10 min):**
+---
 
-1. Install wrangler and authenticate:
-   ```bash
-   bun install                       # gets wrangler + @cloudflare/containers
-   bunx wrangler login               # opens browser, OAuth flow
-   ```
+## One-time setup (~10 min)
 
-2. Build the MOTIS graph and pack it into the tarball that the Dockerfile bakes in. This step needs ~6 GB free RAM (don't run on a tiny VM):
-   ```bash
-   # Refresh source data (skip if data/ already populated):
-   mkdir -p data
-   curl -L -o data/septa-gtfs.zip https://www3.septa.org/developer/gtfs_public.zip
-   unzip -p data/septa-gtfs.zip google_bus.zip > data/google_bus.zip
-   unzip -p data/septa-gtfs.zip google_rail.zip > data/google_rail.zip
-   curl -L -o data/pennsylvania-latest.osm.pbf \
-     https://download.geofabrik.de/north-america/us/pennsylvania-latest.osm.pbf
+### 1. Install + log in
 
-   # Clip OSM to the SEPTA region (~84 MB instead of 333):
-   osmium extract --bbox=-76.0,39.55,-74.65,40.45 \
-     data/pennsylvania-latest.osm.pbf -o data/septa-region.osm.pbf
+```bash
+cd ~/Documents/dev/septa-isochrone
+bun install                       # gets wrangler + @cloudflare/containers
+bunx wrangler login               # opens browser; OAuth flow
+```
 
-   # Build the MOTIS graph:
-   docker compose run --rm -w /workspace motis /motis import
+`wrangler login` writes credentials to `~/.config/.wrangler/config/default.toml`.
+You only do this once per machine.
 
-   # Patch onetomany_max_many in the baked config (MOTIS rebakes a copy at import):
-   sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' \
-     data/data/config.yml
+### 2. Bump Docker Desktop memory (one-time, if you haven't)
 
-   # Pack into the tarball that the Dockerfile bakes in:
-   bun run pack:motis
-   ls -lh dist/motis-dataset.tar.gz   # ~120 MB
-   ```
+The Next.js production build peaks around 1.5–2 GB during the
+"Collecting page data" phase. Default Docker Desktop allocations on Mac
+are usually 4 GB, which is enough — but verify:
 
-3. Deploy:
-   ```bash
-   bun run deploy
-   # equivalent to: bunx wrangler deploy
-   ```
+```bash
+docker info | grep -i memory
+```
 
-   First deploy takes ~5 min: wrangler builds the Dockerfile (Next.js
-   compile + dataset bake), pushes the image to CF's registry, and
-   provisions the Worker + Container binding. You'll see the deploy URL
-   at the end (`https://transit-isochrones.<your-account>.workers.dev`).
+If `Total Memory` is < 4 GiB, open Docker Desktop → Settings → Resources
+and raise the memory slider to 4 GB. Restart Docker.
 
-4. Open the URL. The page loads, the warm-up banner shows for ~25 s
-   while MOTIS mmaps the graph, then disappears. Click around.
+### 3. Build the MOTIS dataset locally
 
-That's it. No DNS, no TLS, no ssh, no cron job.
+This is the one expensive step — needs ~6 GB free RAM. You only re-run
+it when SEPTA's GTFS or PA OSM update (quarterly-ish):
 
-## Custom domain
+```bash
+# Source data (skip if data/ is already populated):
+mkdir -p data
+curl -L -o data/septa-gtfs.zip https://www3.septa.org/developer/gtfs_public.zip
+unzip -p data/septa-gtfs.zip google_bus.zip > data/google_bus.zip
+unzip -p data/septa-gtfs.zip google_rail.zip > data/google_rail.zip
+curl -L -o data/pennsylvania-latest.osm.pbf \
+  https://download.geofabrik.de/north-america/us/pennsylvania-latest.osm.pbf
 
-If you want `transit-isochrones.your-domain.com` instead of the
-`workers.dev` URL:
+# Clip OSM to the SEPTA region:
+brew install osmium-tool   # one-time
+osmium extract --bbox=-76.0,39.55,-74.65,40.45 \
+  data/pennsylvania-latest.osm.pbf -o data/septa-region.osm.pbf
 
-1. Add your domain to Cloudflare (Sites → Add Site).
-2. Uncomment the `routes` block in `wrangler.jsonc` and set both fields.
-3. `bun run deploy` again.
+# Build the MOTIS graph:
+docker compose run --rm -w /workspace motis /motis import
 
-CF auto-provisions the cert. You don't see Let's Encrypt anywhere in
-this flow.
+# Patch onetomany_max_many in the baked config (MOTIS rebakes a copy
+# at import; this is the project's quirk, see CLAUDE.md memory):
+sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' \
+  data/data/config.yml
+
+# Pack into the tarball the Docker image bakes in:
+bun run pack:motis
+ls -lh dist/motis-dataset.tar.gz   # ~120 MB
+```
+
+### 4. Deploy
+
+```bash
+bun run deploy
+```
+
+This is the only command you run for every deploy. What happens:
+1. Wrangler reads `wrangler.jsonc`.
+2. Wrangler invokes Docker to build the `Dockerfile`. The Next.js build
+   runs (~3 min); the dataset tarball is `COPY`'d in and extracted
+   into `/workspace/data` (~10 s).
+3. The resulting ~700 MB image is pushed to Cloudflare's container
+   registry (~1–3 min depending on your upload speed).
+4. Wrangler provisions/updates the Worker and the Container binding.
+
+Total first-deploy time: **~5–8 min**. Subsequent code-only deploys
+reuse the dataset layer from cache and run in ~2–3 min.
+
+At the end, Wrangler prints something like:
+```
+Published transit-isochrones (X.Xs)
+  https://transit-isochrones.<your-account>.workers.dev
+```
+
+That's the deployed URL. Open it in a browser.
+
+### 5. First request
+
+The amber "Warming up — first query ready in ~30 s" banner shows for
+the first ~25 s while MOTIS mmaps the graph. The Map UI is interactive
+the whole time — pin an origin, set the slider, etc. By the time you
+click Run, MOTIS is hot.
+
+---
 
 ## Recurring tasks
 
@@ -78,20 +111,20 @@ this flow.
 bun run deploy
 ```
 
-Wrangler diffs the image; if only Next.js source changed (no Dockerfile
-change), the Next.js layer rebuilds and the dataset layer is reused
-from cache. ~1–2 min.
+Wrangler diffs the image. Source-only changes rebuild only the Next.js
+layer; the dataset layer is reused from cache. ~2–3 min.
 
 ### Refresh the MOTIS dataset (new GTFS, etc.)
 
 ```bash
-# Re-import + re-pack:
 docker compose run --rm -w /workspace motis /motis import
 sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' data/data/config.yml
 bun run pack:motis
-# Re-deploy bakes the new tarball into the image:
 bun run deploy
 ```
+
+The new tarball is now in `dist/`; `wrangler deploy` picks it up via
+the `COPY` in `Dockerfile` and bakes it into the next image push.
 
 ### Tail logs
 
@@ -99,48 +132,68 @@ bun run deploy
 bunx wrangler tail
 ```
 
-Streams stdout/stderr from the running container in real time.
+Streams stdout/stderr from the live container in real time. Useful for
+debugging failed boots.
 
-### Inspect / scale instance type
+### Change instance size
 
-`wrangler.jsonc` → `containers[0].instance_type`:
-- `dev` (256 MB, 1/16 vCPU) — too small for MOTIS.
-- `basic` (1 GB, 1/4 vCPU) — current default; fits MOTIS + app comfortably.
-- `standard` (4 GB, 1/2 vCPU) — for tighter polygon latency under load.
+In `wrangler.jsonc`, the `containers[0].instance_type`:
+- `dev` (256 MB, 1/16 vCPU) — **too small for MOTIS**
+- `basic` (1 GB, 1/4 vCPU) — current default; comfortable headroom
+- `standard` (4 GB, 1/2 vCPU) — bump to this for tighter polygon latency under load
 
 Edit and `bun run deploy`.
 
-## How the warm-up flow works
+### Use a custom domain
 
-1. CF Container is asleep (no requests for `sleepAfter` = 5 min).
-2. User visits the page → Worker forwards to the container → container starts.
-3. Next.js is ready in ~3 s and serves the HTML.
-4. The page mounts and immediately fires `/api/health`. That request is
-   what wakes MOTIS — the response will be 503 until MOTIS finishes
-   mmap'ing the graph (~25 s after process start).
-5. The Map UI shows an amber "Warming up — first query ready in ~30 s"
-   banner. Polls `/api/health` every 2 s.
-6. As soon as MOTIS reports ready, banner clears. The user has been
-   exploring the UI in the meantime, so when they click Run, MOTIS is hot.
+Default URL is `https://transit-isochrones.<your-account>.workers.dev`.
+For your own:
 
-Net cold-start UX: ~3 s of "blank page", then HTML loads, then ~25 s
-with the banner — but the user can interact with the slider, mode
-toggles, etc. during that window. By the time they pin an origin and
-hit Run, the polygon comes back at normal latency.
+1. Add the parent zone to Cloudflare (Sites → Add Site).
+2. Uncomment the `routes` block in `wrangler.jsonc` and fill in both fields.
+3. `bun run deploy`.
+
+CF auto-provisions and renews the cert. You don't see Let's Encrypt
+anywhere in this flow.
+
+---
+
+## How the cold-start UX works
+
+1. Container is asleep (no traffic for `sleepAfter` = 5 min).
+2. User visits the page → Worker forwards the request to the container → CF starts the container instance.
+3. Next.js is listening within ~3 s; the HTML response goes out.
+4. The page mounts and the client fires `/api/health`. That request
+   (also forwarded to the container) is what triggers MOTIS's mmap of
+   the baked-in graph. `/api/health` returns 503 for ~25 s while MOTIS
+   loads.
+5. The Map UI shows the amber warm-up banner, polls `/api/health`
+   every 2 s. As soon as MOTIS reports ready, the banner disappears.
+6. The user has been exploring the UI in the meantime, so they don't
+   notice the wait.
+
+Total: ~3 s "blank page" → HTML loads → ~25 s warm-up banner while
+the user interacts → ready.
+
+---
 
 ## Troubleshooting
 
 **`wrangler deploy` fails on `COPY dist/motis-dataset.tar.gz`.** You
-forgot `bun run pack:motis`. The Dockerfile requires the file to exist.
+forgot `bun run pack:motis`. The Dockerfile requires the file to exist
+in the build context.
 
-**Container won't start, logs say `motis import` errors.** The dataset
-in the image is corrupt or built against a different MOTIS version.
-Re-import locally and re-deploy.
+**Build OOM-killed at "Collecting page data".** Docker Desktop has
+< 4 GB allocated. Settings → Resources → bump memory.
 
-**`/api/health` keeps 503'ing past 60 s.** Container ran out of
-memory — `basic` (1 GB) might be too small under load. Bump
-`instance_type` to `standard` and redeploy.
+**Container won't start, logs say `motis: error loading graph`.** The
+dataset in the image is corrupt or built against a different MOTIS
+version. Re-import locally and re-deploy.
 
-**Cold-start banner shows on every visit, even right after one.** Your
+**`/api/health` keeps 503'ing past 60 s in production.** Container ran
+out of memory. `basic` (1 GB) might be too small under burst load.
+Bump `instance_type` to `standard` in `wrangler.jsonc` and redeploy.
+
+**Cold-start banner shows on every visit, even right after one.**
 `sleepAfter` is too short for typical session gaps. Bump from `5m` to
 `15m` or `1h` in `worker/index.ts`.
