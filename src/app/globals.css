@@ -42,3 +42,44 @@ body {
 :root {
   --animate-pulse: pulse-soft 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
+
+/* Full-map transit loader: an SVG of three concentric tracks (rail
+   purple / metro orange / bus gray) with little colored "trains"
+   orbiting at different speeds, plus the cycling departure-board text
+   underneath. Animation lives on the SVG via SMIL <animateTransform>;
+   the loader markup itself is in Map.tsx. */
+.iso-loader {
+  display: block;
+  filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.45));
+}
+
+/* Cycling departure-board text. Keyed on index in JSX so React mounts
+   a fresh node per message, letting the enter animation replay on
+   each swap. */
+.iso-loader-msg {
+  animation: iso-loader-msg-in 0.45s ease-out;
+}
+@keyframes iso-loader-msg-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Trailing "..." that pulses in sequence beside the message — small
+   touch that makes the board feel live. */
+.iso-loader-dots {
+  display: inline-block;
+  margin-left: 0.15em;
+  letter-spacing: 0;
+}
+.iso-loader-dots > span {
+  display: inline-block;
+  opacity: 0;
+  animation: iso-loader-dot 1.2s ease-in-out infinite;
+}
+.iso-loader-dots > span:nth-child(1) { animation-delay: 0s; }
+.iso-loader-dots > span:nth-child(2) { animation-delay: 0.18s; }
+.iso-loader-dots > span:nth-child(3) { animation-delay: 0.36s; }
+@keyframes iso-loader-dot {
+  0%, 60%, 100% { opacity: 0; }
+  20%, 50%      { opacity: 1; }
+}

@@ -87,6 +87,21 @@ function displayMode(mode: string): string {
   return mode === "TRAM" ? "TROLLEY" : mode;
 }
 
+// Cycled in the loading overlay while a polygon query is in flight.
+// Departure-board phrasing — uppercase, terse, schedule-y — so the wait
+// feels intentional. The server doesn't expose phase milestones, so
+// these are evocative rather than literal progress.
+const LOADING_MESSAGES = [
+  "Tracing the rails",
+  "Timing the trains",
+  "Boarding buses",
+  "Riding the El",
+  "Measuring walksheds",
+  "Stitching transfers",
+  "Routing departures",
+  "Inking the polygon",
+];
+
 // Line color per leg mode. Transit modes reuse the stop palette for
 // consistency; walk/bike are neutrals so they don't compete visually.
 function legColor(mode: string): string {
@@ -167,6 +182,18 @@ export default function Map() {
   // concrete counter instead of just a pulse. Starts when stops land,
   // clears when polygon lands.
   const [polygonElapsed, setPolygonElapsed] = useState<number>(0);
+  // Index into LOADING_MESSAGES, advanced every 1.6 s while loading.
+  // Reset to 0 on each new query so the user sees the first message
+  // land immediately instead of mid-rotation.
+  const [loadingMsgIdx, setLoadingMsgIdx] = useState(0);
+  useEffect(() => {
+    if (!loading) return;
+    setLoadingMsgIdx(0);
+    const t = window.setInterval(() => {
+      setLoadingMsgIdx((i) => (i + 1) % LOADING_MESSAGES.length);
+    }, 1600);
+    return () => window.clearInterval(t);
+  }, [loading]);
   // Start empty so SSR and first client render match; set to "now" after mount.
   const [departure, setDeparture] = useState<string>("");
   // Default ON: single-time queries only see rail stations whose
@@ -1005,6 +1032,69 @@ export default function Map() {
         <div className="absolute top-4 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 shadow dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
           <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-500" />
           <span>Warming up the routing engine — first query will be ready in ~30 s.</span>
+        </div>
+      )}
+      {loading && (
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-7 bg-neutral-950/55 backdrop-blur-sm">
+          <svg
+            className="iso-loader"
+            viewBox="-110 -110 220 220"
+            width="220"
+            height="220"
+            aria-hidden
+          >
+            {/* Three concentric "tracks" in SEPTA mode colors. Dashed
+                strokes evoke ties / route lines on a system map. */}
+            <circle r="86" fill="none" stroke="#7c3aed" strokeOpacity="0.28" strokeWidth="1.5" strokeDasharray="5 5" />
+            <circle r="58" fill="none" stroke="#f97316" strokeOpacity="0.30" strokeWidth="1.5" strokeDasharray="5 5" />
+            <circle r="32" fill="none" stroke="#9ca3af" strokeOpacity="0.32" strokeWidth="1.5" strokeDasharray="4 4" />
+
+            {/* Trains: a rounded rectangle with a small "headlight" dot,
+                each running its own track at its own speed. SMIL rotate
+                around (0,0) — viewBox-centered — is rock-solid across
+                browsers and avoids the SVG transform-origin quirks. */}
+            <g>
+              <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="6s" repeatCount="indefinite" />
+              <g transform="translate(0 -86)">
+                <rect x="-13" y="-6" width="26" height="12" rx="3" fill="#7c3aed" />
+                <circle cx="10" cy="0" r="1.5" fill="#fde68a" />
+              </g>
+            </g>
+            <g>
+              <animateTransform attributeName="transform" type="rotate" from="360 0 0" to="0 0 0" dur="4s" repeatCount="indefinite" />
+              <g transform="translate(0 -58)">
+                <rect x="-11" y="-5" width="22" height="10" rx="2.5" fill="#f97316" />
+                <circle cx="8.5" cy="0" r="1.4" fill="#fde68a" />
+              </g>
+            </g>
+            <g>
+              <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="2.6s" repeatCount="indefinite" />
+              <g transform="translate(0 -32)">
+                <rect x="-9" y="-4" width="18" height="8" rx="2" fill="#9ca3af" />
+                <circle cx="7" cy="0" r="1.2" fill="#fde68a" />
+              </g>
+            </g>
+
+            {/* Origin "station": white-haloed blue dot at the hub. */}
+            <circle r="10" fill="none" stroke="#1d4ed8" strokeOpacity="0.5" strokeWidth="2" />
+            <circle r="6" fill="#1d4ed8" stroke="#ffffff" strokeWidth="2" />
+          </svg>
+          <div className="flex flex-col items-center gap-2">
+            <div
+              key={loadingMsgIdx}
+              className="iso-loader-msg font-mono text-sm font-semibold uppercase tracking-[0.18em] text-neutral-100"
+            >
+              {LOADING_MESSAGES[loadingMsgIdx]}
+              <span className="iso-loader-dots">
+                <span>.</span><span>.</span><span>.</span>
+              </span>
+            </div>
+            {polygonElapsed > 0 && (
+              <div className="font-mono text-[11px] tabular-nums text-neutral-400">
+                {polygonElapsed}s elapsed
+              </div>
+            )}
+          </div>
         </div>
       )}
       {(loading || stopCount !== null) && (
