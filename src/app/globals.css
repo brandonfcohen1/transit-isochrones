@@ -24,3 +24,21 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Tailwind v4's @keyframes pulse only declares a 50% step and renders as a
+   static dot in some Chromium builds when the element's resting opacity
+   matches the implicit endpoint. Point .animate-pulse at our own keyframes
+   with explicit 0%/100% steps so the loading indicators pulse reliably. */
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+:root {
+  --animate-pulse: pulse-soft 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
