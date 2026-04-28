@@ -87,6 +87,10 @@ sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' \
 # Pack into the tarball the Docker image bakes in:
 bun run pack:motis
 ls -lh dist/motis-dataset.tar.gz   # ~120 MB
+
+# Refresh src/lib/rail-line-offsets.json so /api/isochrone's per-line
+# rail-reach back-fill picks up any new termini or stop sequences:
+bun run build:rail-offsets
 ```
 
 ### 5. Deploy
@@ -141,6 +145,7 @@ layer; the dataset layer is reused from cache. ~2–3 min.
 docker compose run --rm -w /workspace motis /motis import
 sed -i '' 's/onetomany_max_many: 128/onetomany_max_many: 1024/' data/data/config.yml
 bun run pack:motis
+bun run build:rail-offsets
 bun run deploy
 ```
 
