@@ -36,9 +36,9 @@ FROM ghcr.io/motis-project/motis:latest
 
 USER root
 
-# MOTIS's upstream image is Alpine 3.20. Add supervisord, Node (for the
-# Next.js standalone server) and curl (for the in-container healthcheck).
-RUN apk add --no-cache supervisor nodejs curl ca-certificates
+# MOTIS's upstream image is Alpine 3.20. Add Node (for Next.js standalone)
+# and curl (for the in-container healthcheck).
+RUN apk add --no-cache nodejs curl ca-certificates
 
 # Copy Next standalone output. The standalone folder already contains
 # server.js + the minimal node_modules subset actually imported.
@@ -48,7 +48,8 @@ COPY --from=app-build /app/.next/standalone/ ./
 COPY --from=app-build /app/.next/static ./.next/static
 COPY --from=app-build /app/public ./public
 
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY scripts/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
 
 # Bake the MOTIS dataset into the image. On Cloudflare Containers each
 # cold start gets a fresh ephemeral disk, so fetching from R2 every time
@@ -66,4 +67,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:3000/api/health >/dev/null || exit 1
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+CMD ["/usr/local/bin/start.sh"]

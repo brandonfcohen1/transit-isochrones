@@ -9,7 +9,10 @@ node_modules
 .vercel
 data
 bench
-scripts
+# Keep scripts/start.sh; build/test scripts aren't needed in the image.
+scripts/build-routes-geojson.ts
+scripts/pack-motis-dataset.ts
+scripts/test-coverage.ts
 *.log
 *.tsbuildinfo
 .DS_Store
