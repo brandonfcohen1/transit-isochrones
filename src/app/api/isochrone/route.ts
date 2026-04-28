@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import type { Mode, Reachable } from "@motis-project/motis-client";
+import type { Mode, PlanResponse, Reachable } from "@motis-project/motis-client";
 import type { FeatureCollection, MultiPolygon, Polygon } from "geojson";
-import { oneToAll, motisTimeoutSignal } from "@/lib/motis";
+import { oneToAll, plan, motisTimeoutSignal } from "@/lib/motis";
 import type { SlimStop, StopMode, StreetMode } from "@/lib/types";
 import { graphIsochrone } from "@/lib/graphIsochrone";
 import { LRU, cacheStats } from "@/lib/cache";
@@ -43,6 +43,12 @@ const GRAPH_CACHE = new LRU<string, FeatureCollection<Polygon | MultiPolygon> | 
 // Rail sub-sample cache. Keyed by (origin, minutes, mode, time-set).
 // Warm repeats skip the 36 × oneToAll rail-only calls entirely.
 const RAIL_SUB_CACHE = new LRU<string, SlimStop[]>(200);
+
+// Per-stop plan() override cache for the rail-reach correction (see
+// railVerify pass below). Keyed by (origin, mode, day-window, stopId)
+// so same-day repeats skip MOTIS. null = MOTIS returned no itinerary
+// (stop genuinely unreachable from origin).
+const RAIL_PLAN_CACHE = new LRU<string, number | null>(2000);
 
 function graphKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode, modesKey: string): string {
   const minute = time.slice(0, 16);
@@ -280,7 +286,12 @@ export async function GET(req: Request) {
       }
       if (subSamples.length > 0) {
         const tRail = performance.now();
-        const railParams = { ...baseParams, transitModes: ["REGIONAL_RAIL"] as Mode[], maxTransfers: 1 };
+        // Inflate the search budget by 15 min so the plan() verify pass
+        // below can recover stops that oneToAll over-reports (notably
+        // AIR / Chestnut Hill East / Fox Chase, which read 5-12 min
+        // high from oneToAll's RAPTOR rounds). Filtered back to the
+        // user's `minutes` after correction.
+        const railParams = { ...baseParams, maxTravelTime: minutes + 15, transitModes: ["REGIONAL_RAIL"] as Mode[], maxTransfers: 1 };
         const railResults = await mapMotis(subSamples, (t) =>
           oneToAll({ query: { ...railParams, time: t }, signal: motisTimeoutSignal() }),
         );
@@ -319,7 +330,84 @@ export async function GET(req: Request) {
     const prev = stopsById.get(id);
     if (!prev || prev.d > s.d) stopsById.set(id, s);
   }
-  const stops = Array.from(stopsById.values());
+
+  // Rail-reach correction. MOTIS one-to-all under-reports duration on
+  // long branch-lines (AIR, Chestnut Hill East, Fox Chase, Trenton tail)
+  // by 5-12 min — RAPTOR rounds don't always extend a single vehicle's
+  // reach to its remaining stops, so each downstream stop reads as if
+  // it needed a fresh boarding. plan() solves origin → one-target with
+  // full trip extension and gets the right answer.
+  //
+  // Targeted to *marginal* stops: those whose oneToAll d is within the
+  // observed inflation band of the budget cutoff. Stops well inside
+  // budget are visually equivalent at d=15 vs d=18 — not worth a plan()
+  // call. Stops we'd correct from above-budget into-budget are the
+  // visible win (airports, etc).
+  //
+  // Skipped for single-time queries (user wants "right now" timing).
+  const RAIL_VERIFY_MARGIN = 12;
+  if (railEnabled && times.length > 1) {
+    const railCandidates = Array.from(stopsById.values()).filter(
+      (s) => s.m === "rail" && s.d >= minutes - RAIL_VERIFY_MARGIN,
+    );
+    const earliest = times.slice().sort()[0];
+    // 4 h window from the earliest sample is plenty: AIR / CHE / FOX
+    // run every ~30 min, so the next-train wait at the optimal sample
+    // is bounded. Keeps each plan() call to ~200-500 ms instead of the
+    // multi-second cost of a true 18 h timetableView fan-out.
+    const planWindow = 4 * 3600;
+    const planCacheKeyFor = (id: string) =>
+      `${snap(lat)},${snap(lon)},${minutes},${earliest},${mode},${modesKey}|${id}`;
+    const tPlan = performance.now();
+    const planResults = await mapMotis(railCandidates, async (s) => {
+      const ck = planCacheKeyFor(s.id);
+      const cached = RAIL_PLAN_CACHE.get(ck);
+      if (cached !== undefined) return [s, cached] as const;
+      const r = await plan({
+        signal: motisTimeoutSignal(),
+        query: {
+          fromPlace: `${lat},${lon}`,
+          toPlace: s.id,
+          time: earliest,
+          searchWindow: planWindow,
+          arriveBy: false,
+          transitModes,
+          preTransitModes: [streetMode],
+          postTransitModes: [streetMode],
+          directModes: [streetMode],
+          maxTransfers: 3,
+          useRoutedTransfers: true,
+          detailedLegs: false,
+          detailedTransfers: false,
+        },
+      });
+      if (r.error || !r.data) {
+        RAIL_PLAN_CACHE.set(ck, null);
+        return [s, null] as const;
+      }
+      const its = (r.data as PlanResponse).itineraries ?? [];
+      if (its.length === 0) {
+        RAIL_PLAN_CACHE.set(ck, null);
+        return [s, null] as const;
+      }
+      const minDurMin = Math.round(Math.min(...its.map((it) => it.duration)) / 60);
+      RAIL_PLAN_CACHE.set(ck, minDurMin);
+      return [s, minDurMin] as const;
+    });
+    let corrected = 0;
+    for (const [s, planD] of planResults) {
+      if (planD != null && planD < s.d) {
+        stopsById.set(s.id, { ...s, d: planD });
+        corrected++;
+      }
+    }
+    mark(`rail-plan[${railCandidates.length}/${corrected}]`, tPlan);
+  }
+
+  // Final budget filter — rail-sub widened the search to capture stops
+  // that the plan-verify pass might pull back into range, so cull
+  // anything still over the user's minutes.
+  const stops = Array.from(stopsById.values()).filter((s) => s.d <= minutes);
 
   // Early return for stops-only: skip probe + graph so the client can
   // render dots while the polygon computes in a parallel request.
