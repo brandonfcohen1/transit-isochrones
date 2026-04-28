@@ -199,6 +199,17 @@ export async function GET(req: Request) {
       detailedTransfers: true,
       useRoutedTransfers: true,
       maxTransfers: 3,
+      // Transfer-quality knobs (minutes — MOTIS API is min, not sec).
+      // Without these, MOTIS minimizes wall-clock only and a 1-min bus
+      // that catches a slightly earlier train wins by ~1–2 min over a
+      // straight walk-to-rail with 0 transfers (observed: 1380s w/ BUS 33
+      // → 1m walk → AIR vs. 1500s direct walk → AIR). 2-min additional
+      // transfer time penalizes each interchange enough that a sub-2-min
+      // bus shortcut has to actually beat the walk by >2 min, while
+      // 2-min minTransferTime adds realistic platform slack so MOTIS
+      // stops planning 0-min-wait bus boards.
+      additionalTransferTime: 2,
+      minTransferTime: 2,
       // timetableView is required for searchWindow to fan out across the
       // day; without it MOTIS picks one Pareto-optimal answer near `time`
       // and ignores the rest of the window. Off when no window override
