@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
-import type { Mode, Reachable } from "@motis-project/motis-client";
+import type { Mode, PlanResponse, Reachable } from "@motis-project/motis-client";
 import type { FeatureCollection, MultiPolygon, Polygon } from "geojson";
-import { oneToAll, motisTimeoutSignal } from "@/lib/motis";
+import { oneToAll, plan, motisTimeoutSignal } from "@/lib/motis";
 import type { SlimStop, StopMode, StreetMode } from "@/lib/types";
 import { graphIsochrone } from "@/lib/graphIsochrone";
 import { LRU, cacheStats } from "@/lib/cache";
 import { mapMotis } from "@/lib/motisLimiter";
 import { rateLimit } from "@/lib/rateLimit";
+import railLineOffsets from "@/lib/rail-line-offsets.json";
 
 // Cache one-to-all results by (snapped origin, minutes, hour bucket). GTFS is
 // static between feed reloads, so same inputs yield identical outputs. Repeat
@@ -43,6 +44,19 @@ const GRAPH_CACHE = new LRU<string, FeatureCollection<Polygon | MultiPolygon> | 
 // Rail sub-sample cache. Keyed by (origin, minutes, mode, time-set).
 // Warm repeats skip the 36 × oneToAll rail-only calls entirely.
 const RAIL_SUB_CACHE = new LRU<string, SlimStop[]>(200);
+
+// Per-line-terminus reach cache for the rail-correction back-fill (see
+// railTerminusVerify pass). One entry per (origin, mode, day-window,
+// terminusId) — 13 termini per query, so cache is small. null = MOTIS
+// found no itinerary.
+const RAIL_TERMINUS_CACHE = new LRU<string, number | null>(500);
+
+type RailLineEntry = {
+  terminusId: string;
+  terminusName: string;
+  stops: Array<{ id: string; fromTerminusMin: number }>;
+};
+const RAIL_LINES = railLineOffsets as Record<string, RailLineEntry>;
 
 function graphKey(lat: number, lon: number, minutes: number, time: string, mode: StreetMode, modesKey: string): string {
   const minute = time.slice(0, 16);
@@ -280,7 +294,11 @@ export async function GET(req: Request) {
       }
       if (subSamples.length > 0) {
         const tRail = performance.now();
-        const railParams = { ...baseParams, transitModes: ["REGIONAL_RAIL"] as Mode[], maxTransfers: 1 };
+        // Widen the search budget so the per-terminus back-fill below
+        // can pull in stops that oneToAll over-reports as out-of-budget
+        // (most visibly the airport terminals, which read 34-39 min on
+        // a 30-min budget but are actually ~23-28 min real-time).
+        const railParams = { ...baseParams, maxTravelTime: minutes + 15, transitModes: ["REGIONAL_RAIL"] as Mode[], maxTransfers: 1 };
         const railResults = await mapMotis(subSamples, (t) =>
           oneToAll({ query: { ...railParams, time: t }, signal: motisTimeoutSignal() }),
         );
@@ -319,7 +337,84 @@ export async function GET(req: Request) {
     const prev = stopsById.get(id);
     if (!prev || prev.d > s.d) stopsById.set(id, s);
   }
-  const stops = Array.from(stopsById.values());
+
+  // Rail-reach correction via per-terminus plan() + GTFS back-fill.
+  // MOTIS one-to-all under-reports duration on long branch lines (AIR,
+  // CHE, FOX, Trenton tail) by 5-12 min: RAPTOR rounds don't always
+  // extend a single vehicle's reach across all its remaining stops.
+  // plan() solves origin → one target with full trip extension.
+  //
+  // Per-stop plan() was prohibitive on CF's small vCPU. Instead: one
+  // plan() per *line terminus* (13 total) and back-fill each stop on
+  // the line as `terminus_d - fromTerminusMin` from rail-line-offsets.json.
+  // ~13 calls instead of ~50, fits the standard-2 vCPU budget.
+  //
+  // Skipped for single-time queries (user wants tight "right now" timing).
+  if (railEnabled && times.length > 1) {
+    const earliest = times.slice().sort()[0];
+    const planWindow = 4 * 3600;
+    const lineKeyFor = (terminusId: string) =>
+      `${snap(lat)},${snap(lon)},${minutes},${earliest},${mode},${modesKey}|${terminusId}`;
+    const tTerm = performance.now();
+    const lineEntries = Object.entries(RAIL_LINES);
+    const terminusReach = await mapMotis(lineEntries, async ([route, line]) => {
+      const ck = lineKeyFor(line.terminusId);
+      const cached = RAIL_TERMINUS_CACHE.get(ck);
+      if (cached !== undefined) return [route, line, cached] as const;
+      const r = await plan({
+        signal: motisTimeoutSignal(),
+        query: {
+          fromPlace: `${lat},${lon}`,
+          toPlace: line.terminusId,
+          time: earliest,
+          searchWindow: planWindow,
+          arriveBy: false,
+          transitModes,
+          preTransitModes: [streetMode],
+          postTransitModes: [streetMode],
+          directModes: [streetMode],
+          maxTransfers: 3,
+          useRoutedTransfers: true,
+          detailedLegs: false,
+          detailedTransfers: false,
+        },
+      });
+      if (r.error || !r.data) {
+        RAIL_TERMINUS_CACHE.set(ck, null);
+        return [route, line, null] as const;
+      }
+      const its = (r.data as PlanResponse).itineraries ?? [];
+      if (its.length === 0) {
+        RAIL_TERMINUS_CACHE.set(ck, null);
+        return [route, line, null] as const;
+      }
+      const minDurMin = Math.round(Math.min(...its.map((it) => it.duration)) / 60);
+      RAIL_TERMINUS_CACHE.set(ck, minDurMin);
+      return [route, line, minDurMin] as const;
+    });
+    let backfilled = 0;
+    for (const [, line, terminusD] of terminusReach) {
+      if (terminusD == null) continue;
+      for (const stop of line.stops) {
+        const computed = terminusD - stop.fromTerminusMin;
+        if (computed <= 0) continue;
+        const prev = stopsById.get(stop.id);
+        if (prev && prev.d > computed) {
+          stopsById.set(stop.id, { ...prev, d: computed });
+          backfilled++;
+        } else if (!prev && computed <= minutes) {
+          // Stop wasn't reachable per oneToAll; back-fill brought it
+          // in-budget. Need its lat/lon — pull from any other stop with
+          // the same id, or skip (very rare; we'd miss it on the polygon).
+          // For now skip — the rail-sub already covers most cases; the
+          // common situation is "prev exists but d is inflated".
+        }
+      }
+    }
+    mark(`rail-term[${lineEntries.length}/${backfilled}]`, tTerm);
+  }
+
+  const stops = Array.from(stopsById.values()).filter((s) => s.d <= minutes);
 
   // Early return for stops-only: skip probe + graph so the client can
   // render dots while the polygon computes in a parallel request.

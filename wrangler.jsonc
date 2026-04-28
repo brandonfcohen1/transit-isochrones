@@ -17,12 +17,11 @@
       "class_name": "App",
       "image": "./Dockerfile",
       "max_instances": 1,
-      // standard = 4 GB RAM, 1/2 vCPU. The 1/4 vCPU on basic was too
-      // narrow: MOTIS's graph mmap (~25 s of intensive read) starves
-      // Next.js, which then doesn't bind :3000 within CF's 20 s
-      // port-ready window — first deploys fail with "container is not
-      // listening in the TCP address 10.0.0.1:3000".
-      "instance_type": "standard"
+      // standard-2 = 6 GiB RAM, 1 full vCPU. The previous standard-1
+      // (1/2 vCPU) couldn't absorb the rail-reach plan() fan-out — MOTIS
+      // crashed under the burst. +$1/mo over standard-1; halves cold-
+      // query wall-clock for everyone as a side effect.
+      "instance_type": "standard-2"
     }
   ],
   "durable_objects": {

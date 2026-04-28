@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "build:routes": "bun scripts/build-routes-geojson.ts",
+    "build:rail-offsets": "bun scripts/build-rail-line-offsets.ts",
     "pack:motis": "bun scripts/pack-motis-dataset.ts",
     "deploy": "wrangler deploy",
     "bench": "bun bench/run.ts",

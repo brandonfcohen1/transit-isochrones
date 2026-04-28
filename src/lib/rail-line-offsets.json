@@ -1,0 +1,928 @@
+{
+  "CYN": {
+    "terminusId": "googlerail_90001",
+    "terminusName": "Cynwyd",
+    "stops": [
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 22
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 17
+      },
+      {
+        "id": "googlerail_90003",
+        "fromTerminusMin": 6
+      },
+      {
+        "id": "googlerail_90002",
+        "fromTerminusMin": 3
+      },
+      {
+        "id": "googlerail_90001",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "WIL": {
+    "terminusId": "googlerail_90201",
+    "terminusName": "Newark DE",
+    "stops": [
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 91
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 85
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 80
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 75
+      },
+      {
+        "id": "googlerail_90406",
+        "fromTerminusMin": 72
+      },
+      {
+        "id": "googlerail_90217",
+        "fromTerminusMin": 62
+      },
+      {
+        "id": "googlerail_90216",
+        "fromTerminusMin": 60
+      },
+      {
+        "id": "googlerail_90215",
+        "fromTerminusMin": 58
+      },
+      {
+        "id": "googlerail_90214",
+        "fromTerminusMin": 56
+      },
+      {
+        "id": "googlerail_90213",
+        "fromTerminusMin": 54
+      },
+      {
+        "id": "googlerail_90212",
+        "fromTerminusMin": 52
+      },
+      {
+        "id": "googlerail_90211",
+        "fromTerminusMin": 50
+      },
+      {
+        "id": "googlerail_90210",
+        "fromTerminusMin": 48
+      },
+      {
+        "id": "googlerail_90209",
+        "fromTerminusMin": 46
+      },
+      {
+        "id": "googlerail_90207",
+        "fromTerminusMin": 43
+      },
+      {
+        "id": "googlerail_90206",
+        "fromTerminusMin": 39
+      },
+      {
+        "id": "googlerail_90205",
+        "fromTerminusMin": 36
+      },
+      {
+        "id": "googlerail_90204",
+        "fromTerminusMin": 32
+      },
+      {
+        "id": "googlerail_90203",
+        "fromTerminusMin": 20
+      },
+      {
+        "id": "googlerail_90202",
+        "fromTerminusMin": 10
+      },
+      {
+        "id": "googlerail_90201",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "MED": {
+    "terminusId": "googlerail_90300",
+    "terminusName": "Wawa",
+    "stops": [
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 62
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 56
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 51
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 47
+      },
+      {
+        "id": "googlerail_90406",
+        "fromTerminusMin": 44
+      },
+      {
+        "id": "googlerail_90314",
+        "fromTerminusMin": 40
+      },
+      {
+        "id": "googlerail_90313",
+        "fromTerminusMin": 38
+      },
+      {
+        "id": "googlerail_90312",
+        "fromTerminusMin": 36
+      },
+      {
+        "id": "googlerail_90311",
+        "fromTerminusMin": 34
+      },
+      {
+        "id": "googlerail_90310",
+        "fromTerminusMin": 32
+      },
+      {
+        "id": "googlerail_90309",
+        "fromTerminusMin": 30
+      },
+      {
+        "id": "googlerail_90308",
+        "fromTerminusMin": 28
+      },
+      {
+        "id": "googlerail_90307",
+        "fromTerminusMin": 26
+      },
+      {
+        "id": "googlerail_90306",
+        "fromTerminusMin": 24
+      },
+      {
+        "id": "googlerail_90305",
+        "fromTerminusMin": 21
+      },
+      {
+        "id": "googlerail_90304",
+        "fromTerminusMin": 18
+      },
+      {
+        "id": "googlerail_90303",
+        "fromTerminusMin": 15
+      },
+      {
+        "id": "googlerail_90302",
+        "fromTerminusMin": 13
+      },
+      {
+        "id": "googlerail_90301",
+        "fromTerminusMin": 6
+      },
+      {
+        "id": "googlerail_90300",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "TRE": {
+    "terminusId": "googlerail_90701",
+    "terminusName": "Trenton",
+    "stops": [
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 71
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 65
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 60
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 55
+      },
+      {
+        "id": "googlerail_90711",
+        "fromTerminusMin": 45
+      },
+      {
+        "id": "googlerail_90710",
+        "fromTerminusMin": 37
+      },
+      {
+        "id": "googlerail_90709",
+        "fromTerminusMin": 34
+      },
+      {
+        "id": "googlerail_90708",
+        "fromTerminusMin": 32
+      },
+      {
+        "id": "googlerail_90707",
+        "fromTerminusMin": 29
+      },
+      {
+        "id": "googlerail_90706",
+        "fromTerminusMin": 26
+      },
+      {
+        "id": "googlerail_90705",
+        "fromTerminusMin": 24
+      },
+      {
+        "id": "googlerail_90704",
+        "fromTerminusMin": 21
+      },
+      {
+        "id": "googlerail_90703",
+        "fromTerminusMin": 18
+      },
+      {
+        "id": "googlerail_90702",
+        "fromTerminusMin": 13
+      },
+      {
+        "id": "googlerail_90701",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "NOR": {
+    "terminusId": "googlerail_90228",
+    "terminusName": "Norristown Elm Street",
+    "stops": [
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 52
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 47
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 42
+      },
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 38
+      },
+      {
+        "id": "googlerail_90008",
+        "fromTerminusMin": 36
+      },
+      {
+        "id": "googlerail_90218",
+        "fromTerminusMin": 32
+      },
+      {
+        "id": "googlerail_90219",
+        "fromTerminusMin": 30
+      },
+      {
+        "id": "googlerail_90220",
+        "fromTerminusMin": 28
+      },
+      {
+        "id": "googlerail_90221",
+        "fromTerminusMin": 26
+      },
+      {
+        "id": "googlerail_90222",
+        "fromTerminusMin": 24
+      },
+      {
+        "id": "googlerail_90223",
+        "fromTerminusMin": 19
+      },
+      {
+        "id": "googlerail_90224",
+        "fromTerminusMin": 16
+      },
+      {
+        "id": "googlerail_90225",
+        "fromTerminusMin": 14
+      },
+      {
+        "id": "googlerail_90226",
+        "fromTerminusMin": 7
+      },
+      {
+        "id": "googlerail_90227",
+        "fromTerminusMin": 4
+      },
+      {
+        "id": "googlerail_90228",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "WTR": {
+    "terminusId": "googlerail_90327",
+    "terminusName": "West Trenton",
+    "stops": [
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 77
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 72
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 67
+      },
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 62
+      },
+      {
+        "id": "googlerail_90407",
+        "fromTerminusMin": 54
+      },
+      {
+        "id": "googlerail_90408",
+        "fromTerminusMin": 52
+      },
+      {
+        "id": "googlerail_90409",
+        "fromTerminusMin": 49
+      },
+      {
+        "id": "googlerail_90410",
+        "fromTerminusMin": 45
+      },
+      {
+        "id": "googlerail_90315",
+        "fromTerminusMin": 42
+      },
+      {
+        "id": "googlerail_90316",
+        "fromTerminusMin": 40
+      },
+      {
+        "id": "googlerail_90317",
+        "fromTerminusMin": 38
+      },
+      {
+        "id": "googlerail_90318",
+        "fromTerminusMin": 36
+      },
+      {
+        "id": "googlerail_90319",
+        "fromTerminusMin": 33
+      },
+      {
+        "id": "googlerail_90320",
+        "fromTerminusMin": 31
+      },
+      {
+        "id": "googlerail_90321",
+        "fromTerminusMin": 30
+      },
+      {
+        "id": "googlerail_90322",
+        "fromTerminusMin": 27
+      },
+      {
+        "id": "googlerail_90323",
+        "fromTerminusMin": 22
+      },
+      {
+        "id": "googlerail_90324",
+        "fromTerminusMin": 18
+      },
+      {
+        "id": "googlerail_90325",
+        "fromTerminusMin": 12
+      },
+      {
+        "id": "googlerail_90326",
+        "fromTerminusMin": 6
+      },
+      {
+        "id": "googlerail_90327",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "AIR": {
+    "terminusId": "googlerail_90401",
+    "terminusName": "Airport Terminals E & F",
+    "stops": [
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 39
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 32
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 27
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 23
+      },
+      {
+        "id": "googlerail_90406",
+        "fromTerminusMin": 20
+      },
+      {
+        "id": "googlerail_90405",
+        "fromTerminusMin": 11
+      },
+      {
+        "id": "googlerail_90404",
+        "fromTerminusMin": 5
+      },
+      {
+        "id": "googlerail_90403",
+        "fromTerminusMin": 4
+      },
+      {
+        "id": "googlerail_90402",
+        "fromTerminusMin": 2
+      },
+      {
+        "id": "googlerail_90401",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "LAN": {
+    "terminusId": "googlerail_90538",
+    "terminusName": "Doylestown",
+    "stops": [
+      {
+        "id": "googlerail_90406",
+        "fromTerminusMin": 89
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 86
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 82
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 78
+      },
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 74
+      },
+      {
+        "id": "googlerail_90008",
+        "fromTerminusMin": 72
+      },
+      {
+        "id": "googlerail_90009",
+        "fromTerminusMin": 67
+      },
+      {
+        "id": "googlerail_90407",
+        "fromTerminusMin": 65
+      },
+      {
+        "id": "googlerail_90410",
+        "fromTerminusMin": 59
+      },
+      {
+        "id": "googlerail_90411",
+        "fromTerminusMin": 57
+      },
+      {
+        "id": "googlerail_90523",
+        "fromTerminusMin": 55
+      },
+      {
+        "id": "googlerail_90524",
+        "fromTerminusMin": 53
+      },
+      {
+        "id": "googlerail_90525",
+        "fromTerminusMin": 50
+      },
+      {
+        "id": "googlerail_90526",
+        "fromTerminusMin": 47
+      },
+      {
+        "id": "googlerail_90527",
+        "fromTerminusMin": 44
+      },
+      {
+        "id": "googlerail_90528",
+        "fromTerminusMin": 41
+      },
+      {
+        "id": "googlerail_90529",
+        "fromTerminusMin": 38
+      },
+      {
+        "id": "googlerail_90530",
+        "fromTerminusMin": 35
+      },
+      {
+        "id": "googlerail_90531",
+        "fromTerminusMin": 30
+      },
+      {
+        "id": "googlerail_90539",
+        "fromTerminusMin": 27
+      },
+      {
+        "id": "googlerail_90532",
+        "fromTerminusMin": 25
+      },
+      {
+        "id": "googlerail_90533",
+        "fromTerminusMin": 23
+      },
+      {
+        "id": "googlerail_90534",
+        "fromTerminusMin": 20
+      },
+      {
+        "id": "googlerail_90535",
+        "fromTerminusMin": 10
+      },
+      {
+        "id": "googlerail_90536",
+        "fromTerminusMin": 6
+      },
+      {
+        "id": "googlerail_90537",
+        "fromTerminusMin": 4
+      },
+      {
+        "id": "googlerail_90538",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "PAO": {
+    "terminusId": "googlerail_90501",
+    "terminusName": "Thorndale",
+    "stops": [
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 94
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 88
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 83
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 78
+      },
+      {
+        "id": "googlerail_90522",
+        "fromTerminusMin": 68
+      },
+      {
+        "id": "googlerail_90521",
+        "fromTerminusMin": 66
+      },
+      {
+        "id": "googlerail_90520",
+        "fromTerminusMin": 64
+      },
+      {
+        "id": "googlerail_90519",
+        "fromTerminusMin": 62
+      },
+      {
+        "id": "googlerail_90518",
+        "fromTerminusMin": 60
+      },
+      {
+        "id": "googlerail_90517",
+        "fromTerminusMin": 58
+      },
+      {
+        "id": "googlerail_90516",
+        "fromTerminusMin": 55
+      },
+      {
+        "id": "googlerail_90515",
+        "fromTerminusMin": 53
+      },
+      {
+        "id": "googlerail_90514",
+        "fromTerminusMin": 50
+      },
+      {
+        "id": "googlerail_90513",
+        "fromTerminusMin": 48
+      },
+      {
+        "id": "googlerail_90512",
+        "fromTerminusMin": 46
+      },
+      {
+        "id": "googlerail_90511",
+        "fromTerminusMin": 44
+      },
+      {
+        "id": "googlerail_90510",
+        "fromTerminusMin": 42
+      },
+      {
+        "id": "googlerail_90509",
+        "fromTerminusMin": 39
+      },
+      {
+        "id": "googlerail_90508",
+        "fromTerminusMin": 37
+      },
+      {
+        "id": "googlerail_90507",
+        "fromTerminusMin": 34
+      },
+      {
+        "id": "googlerail_90506",
+        "fromTerminusMin": 31
+      },
+      {
+        "id": "googlerail_90505",
+        "fromTerminusMin": 27
+      },
+      {
+        "id": "googlerail_90504",
+        "fromTerminusMin": 21
+      },
+      {
+        "id": "googlerail_90503",
+        "fromTerminusMin": 19
+      },
+      {
+        "id": "googlerail_90502",
+        "fromTerminusMin": 12
+      },
+      {
+        "id": "googlerail_90501",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "CHE": {
+    "terminusId": "googlerail_90720",
+    "terminusName": "Chestnut Hill East",
+    "stops": [
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 44
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 39
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 34
+      },
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 29
+      },
+      {
+        "id": "googlerail_90009",
+        "fromTerminusMin": 23
+      },
+      {
+        "id": "googlerail_90712",
+        "fromTerminusMin": 19
+      },
+      {
+        "id": "googlerail_90713",
+        "fromTerminusMin": 17
+      },
+      {
+        "id": "googlerail_90714",
+        "fromTerminusMin": 14
+      },
+      {
+        "id": "googlerail_90715",
+        "fromTerminusMin": 12
+      },
+      {
+        "id": "googlerail_90716",
+        "fromTerminusMin": 10
+      },
+      {
+        "id": "googlerail_90717",
+        "fromTerminusMin": 8
+      },
+      {
+        "id": "googlerail_90718",
+        "fromTerminusMin": 6
+      },
+      {
+        "id": "googlerail_90719",
+        "fromTerminusMin": 4
+      },
+      {
+        "id": "googlerail_90720",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "WAR": {
+    "terminusId": "googlerail_90417",
+    "terminusName": "Warminster",
+    "stops": [
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 58
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 53
+      },
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 48
+      },
+      {
+        "id": "googlerail_90009",
+        "fromTerminusMin": 42
+      },
+      {
+        "id": "googlerail_90407",
+        "fromTerminusMin": 38
+      },
+      {
+        "id": "googlerail_90408",
+        "fromTerminusMin": 36
+      },
+      {
+        "id": "googlerail_90409",
+        "fromTerminusMin": 34
+      },
+      {
+        "id": "googlerail_90410",
+        "fromTerminusMin": 29
+      },
+      {
+        "id": "googlerail_90411",
+        "fromTerminusMin": 25
+      },
+      {
+        "id": "googlerail_90412",
+        "fromTerminusMin": 21
+      },
+      {
+        "id": "googlerail_90413",
+        "fromTerminusMin": 15
+      },
+      {
+        "id": "googlerail_90414",
+        "fromTerminusMin": 12
+      },
+      {
+        "id": "googlerail_90415",
+        "fromTerminusMin": 9
+      },
+      {
+        "id": "googlerail_90416",
+        "fromTerminusMin": 5
+      },
+      {
+        "id": "googlerail_90417",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "CHW": {
+    "terminusId": "googlerail_90801",
+    "terminusName": "Chestnut Hill West",
+    "stops": [
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 35
+      },
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 31
+      },
+      {
+        "id": "googlerail_90810",
+        "fromTerminusMin": 21
+      },
+      {
+        "id": "googlerail_90809",
+        "fromTerminusMin": 15
+      },
+      {
+        "id": "googlerail_90808",
+        "fromTerminusMin": 14
+      },
+      {
+        "id": "googlerail_90807",
+        "fromTerminusMin": 13
+      },
+      {
+        "id": "googlerail_90806",
+        "fromTerminusMin": 11
+      },
+      {
+        "id": "googlerail_90805",
+        "fromTerminusMin": 9
+      },
+      {
+        "id": "googlerail_90804",
+        "fromTerminusMin": 8
+      },
+      {
+        "id": "googlerail_90803",
+        "fromTerminusMin": 6
+      },
+      {
+        "id": "googlerail_90802",
+        "fromTerminusMin": 4
+      },
+      {
+        "id": "googlerail_90801",
+        "fromTerminusMin": 0
+      }
+    ]
+  },
+  "FOX": {
+    "terminusId": "googlerail_90815",
+    "terminusName": "Fox Chase",
+    "stops": [
+      {
+        "id": "googlerail_90004",
+        "fromTerminusMin": 40
+      },
+      {
+        "id": "googlerail_90005",
+        "fromTerminusMin": 35
+      },
+      {
+        "id": "googlerail_90006",
+        "fromTerminusMin": 30
+      },
+      {
+        "id": "googlerail_90007",
+        "fromTerminusMin": 26
+      },
+      {
+        "id": "googlerail_90009",
+        "fromTerminusMin": 20
+      },
+      {
+        "id": "googlerail_90811",
+        "fromTerminusMin": 17
+      },
+      {
+        "id": "googlerail_90812",
+        "fromTerminusMin": 14
+      },
+      {
+        "id": "googlerail_90813",
+        "fromTerminusMin": 7
+      },
+      {
+        "id": "googlerail_90814",
+        "fromTerminusMin": 5
+      },
+      {
+        "id": "googlerail_90815",
+        "fromTerminusMin": 0
+      }
+    ]
+  }
+}
