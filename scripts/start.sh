@@ -16,7 +16,20 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-(cd /workspace && /motis server /workspace/data) &
+# Supervise MOTIS in a respawn loop. MOTIS can die under sustained
+# CPU pressure on small CF instances (we saw it crash hard during a
+# heavy plan() fan-out and stay dead — Next.js kept serving but every
+# /api/* call returned 503). The respawn keeps the container useful
+# instead of needing CF to recycle the whole instance. 2 s pause
+# between respawns avoids tight crash loops if the dataset is bad.
+motis_supervisor() {
+  while true; do
+    (cd /workspace && /motis server /workspace/data)
+    echo "[start.sh] motis exited; respawning in 2 s" >&2
+    sleep 2
+  done
+}
+motis_supervisor &
 motis_pid=$!
 
 cd /app
