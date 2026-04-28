@@ -21,6 +21,14 @@ motis_pid=$!
 
 cd /app
 export MOTIS_URL="http://127.0.0.1:8080"
+# CF Containers' ½ vCPU is much slower than a typical dev box, so cold
+# polygon fan-outs need a longer per-call timeout. 45 s covers the
+# slowest oneToAll under contention while still cutting off a real hang.
+export MOTIS_TIMEOUT_MS="${MOTIS_TIMEOUT_MS:-45000}"
+# Cap parallelism so 50+ best-case fan-out queries don't dogpile MOTIS
+# on the small CPU. 8 keeps mean latency roughly flat with 32 on a big
+# box but avoids the queue-buildup pathology under CPU contention.
+export MOTIS_CONCURRENCY="${MOTIS_CONCURRENCY:-8}"
 export NODE_ENV=production
 export PORT=3000
 export HOSTNAME=0.0.0.0

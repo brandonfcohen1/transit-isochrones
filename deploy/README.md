@@ -23,7 +23,28 @@ bunx wrangler login               # opens browser; OAuth flow
 `wrangler login` writes credentials to `~/.config/.wrangler/config/default.toml`.
 You only do this once per machine.
 
-### 2. Bump Docker Desktop memory (one-time, if you haven't)
+### 2. Create `.env.production` (one-time)
+
+Required: the Dockerfile `COPY`s this file into the Next.js build, even
+if it's empty. Build-time public env vars baked into the client bundle
+go here — most usefully `NEXT_PUBLIC_MAPTILER_KEY` for a real basemap
+(without one, the app falls back to the cartoonish demotiles tile set).
+
+```bash
+# Get a free MapTiler API key at https://www.maptiler.com/cloud/ (the
+# Free tier covers a hobby app comfortably). Then:
+echo "NEXT_PUBLIC_MAPTILER_KEY=your_key_here" > .env.production
+
+# Or if you don't want a key, an empty file is fine:
+touch .env.production
+```
+
+`.env.production` is gitignored (and won't show in the public repo) but
+will be picked up by the Docker build context. The MapTiler key is
+public-by-design (it ends up in the JS bundle); restrict it by domain
+in MapTiler's dashboard if you care.
+
+### 3. Bump Docker Desktop memory (one-time, if you haven't)
 
 The Next.js production build peaks around 1.5–2 GB during the
 "Collecting page data" phase. Default Docker Desktop allocations on Mac
@@ -36,7 +57,7 @@ docker info | grep -i memory
 If `Total Memory` is < 4 GiB, open Docker Desktop → Settings → Resources
 and raise the memory slider to 4 GB. Restart Docker.
 
-### 3. Build the MOTIS dataset locally
+### 4. Build the MOTIS dataset locally
 
 This is the one expensive step — needs ~6 GB free RAM. You only re-run
 it when SEPTA's GTFS or PA OSM update (quarterly-ish):
@@ -68,7 +89,7 @@ bun run pack:motis
 ls -lh dist/motis-dataset.tar.gz   # ~120 MB
 ```
 
-### 4. Deploy
+### 5. Deploy
 
 ```bash
 bun run deploy
@@ -94,7 +115,7 @@ Published transit-isochrones (X.Xs)
 
 That's the deployed URL. Open it in a browser.
 
-### 5. First request
+### 6. First request
 
 The amber "Warming up — first query ready in ~30 s" banner shows for
 the first ~25 s while MOTIS mmaps the graph. The Map UI is interactive

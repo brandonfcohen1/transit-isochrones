@@ -2,7 +2,13 @@ node_modules
 .next
 .git
 .gitignore
-.env*
+.env
+.env.local
+.env.development
+.env.development.local
+.env.test
+.env.test.local
+.env.local.example
 .dev.vars
 .wrangler
 .claude

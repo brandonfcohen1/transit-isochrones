@@ -22,6 +22,10 @@ RUN bun install --frozen-lockfile
 COPY next.config.ts tsconfig.json postcss.config.mjs eslint.config.mjs ./
 COPY src ./src
 COPY public ./public
+# .env.production carries NEXT_PUBLIC_MAPTILER_KEY (and any other
+# build-time public envs). Required: must exist before `wrangler deploy`,
+# even if empty. Gitignored — see deploy/README.md.
+COPY .env.production ./
 ENV NODE_ENV=production
 # Next.js's "Collecting page data" phase parallelizes across CPUs and
 # OOMs in build containers with limited memory (~7-8 workers × ~300 MB
